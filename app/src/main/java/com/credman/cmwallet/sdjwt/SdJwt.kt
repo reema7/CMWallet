@@ -161,6 +161,135 @@ class SdJwt(
         val kbJwt = createJWTES256(kbHeader, kbPayload, holderKey)
         return sdJwt + kbJwt
     }
+
+    @OptIn(ExperimentalSerializationApi::class)
+    fun presentWithDelegations(
+        claimSets: JSONArray?,
+        nonce: String,
+        aud: String,
+        transactionDataHashes: Map<String, List<ByteArray>>,
+        mandateProposals: List<com.credman.cmwallet.openid4vp.MandateProposal>
+    ): String {
+        // Build SD-JWT components (issuer_jwt + selective disclosures) — identical to present()
+        val sdJwtComponents = mutableListOf(issuerJwt)
+        if (claimSets == null) {
+            sdJwtComponents.addAll(disclosures)
+        } else {
+            var claimSetMatched = true
+            for (i in 0..<claimSets.length()) {
+                claimSetMatched = true
+                val claimSet = claimSets[i] as JSONArray
+                val ret = mutableListOf<String>()
+                for (claimIdx in 0 until claimSet.length()) {
+                    val claim = claimSet.getJSONObject(claimIdx)!!
+                    val path = claim.getJSONArray("path")
+                    var sd = verifiedResult.sdMap
+                    val sds = mutableListOf<JSONObject>()
+                    for (pathIdx in 0..<path.length()) {
+                        val currPath = path.getString(pathIdx)
+                        if (sd.has(currPath)) {
+                            sd = sd.getJSONObject(currPath)
+                            sds.add(JSONObject(sd.toString()))
+                        } else {
+                            claimSetMatched = false
+                            break
+                        }
+                    }
+                    if (claimSetMatched) {
+                        addDisclosuresToPresentation(sd, ret)
+                        if (sds.size > 1) {
+                            for (k in 0..<sds.size - 1) {
+                                val currSd = sds[k]
+                                if (currSd.has("_sd")) {
+                                    val digest = currSd.getString("_sd")
+                                    val disclosure = verifiedResult.digestDisclosureMap[digest]!!
+                                    ret.add(disclosure)
+                                }
+                            }
+                        }
+                    } else {
+                        break
+                    }
+                }
+                if (claimSetMatched) {
+                    sdJwtComponents.addAll(ret)
+                    break
+                }
+            }
+            require(claimSetMatched) { "Could not match against any claim sets." }
+        }
+
+        // Base SD-JWT: issuer_jwt~disc1~...~ — sd_hash computed over this, NOT including delegations
+        val sdJwt = sdJwtComponents.joinToString("~", postfix = "~")
+
+        // Generate one delegation JWT per mandate proposal, signed by the holder device key
+        val delegationJwts = mandateProposals.map { mandate ->
+            // Holder public key thumbprint from cnf.jwk embedded in the issuer JWT
+            val cnfJwk = verifiedResult.processedJwt.optJSONObject("cnf")?.optJSONObject("jwk")
+            val holderThumbprint = if (cnfJwk != null) {
+                val canonical = org.json.JSONObject().apply {
+                    put("crv", cnfJwk.optString("crv", "P-256"))
+                    put("kty", cnfJwk.optString("kty", "EC"))
+                    put("x", cnfJwk.optString("x", ""))
+                    put("y", cnfJwk.optString("y", ""))
+                }.toString()
+                val md0 = MessageDigest.getInstance("SHA-256")
+                md0.digest(canonical.toByteArray()).toBase64UrlNoPadding()
+            } else {
+                ""
+            }
+            val txDataHash = MessageDigest.getInstance("SHA-256")
+                .digest(mandate.encodedItem.encodeToByteArray())
+                .toBase64UrlNoPadding()
+            val delegHeader = buildJsonObject {
+                put("typ", "sd-jwt-delegation")
+                put("alg", "ES256")
+            }
+            val delegPayload = buildJsonObject {
+                put("iss", holderThumbprint)
+                put("iat", Instant.now().epochSecond)
+                put("exp", Instant.now().epochSecond + 300L)
+                put("mandate_type", mandate.type)
+                put("aud", aud)
+                put("nonce", nonce)
+                put("constraints", mandate.content.toString())
+                put("transaction_data_hash", txDataHash)
+            }
+            createJWTES256(delegHeader, delegPayload, holderKey)
+        }
+
+        // sd_hash covers issuer_jwt~disclosures~ only
+        val sdHash = MessageDigest.getInstance("SHA-256")
+            .digest(sdJwt.encodeToByteArray())
+            .toBase64UrlNoPadding()
+
+        // KB-JWT
+        val kbHeader = buildJsonObject {
+            put("typ", "kb+jwt")
+            put("alg", "ES256")
+        }
+        val kbPayload = buildJsonObject {
+            put("iat", Instant.now().epochSecond)
+            put("aud", aud)
+            put("nonce", nonce)
+            put("sd_hash", sdHash)
+            if (transactionDataHashes.isNotEmpty()) {
+                for (entry in transactionDataHashes) {
+                    putJsonArray(entry.key) {
+                        entry.value.forEach { data -> add(data.toBase64UrlNoPadding()) }
+                    }
+                }
+            }
+        }
+        val kbJwt = createJWTES256(kbHeader, kbPayload, holderKey)
+
+        // Final: issuer_jwt~disc1~...~delegation1~delegation2~kb_jwt
+        return if (delegationJwts.isEmpty()) {
+            sdJwt + kbJwt
+        } else {
+            sdJwt + delegationJwts.joinToString("~", postfix = "~") + kbJwt
+        }
+    }
 }
 
 class VerificationResult(

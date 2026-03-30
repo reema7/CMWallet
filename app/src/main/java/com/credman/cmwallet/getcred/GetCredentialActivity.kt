@@ -80,13 +80,22 @@ fun createOpenID4VPResponse(
                 val transaction_data_hashes =
                     openId4VPRequest.generateDeviceSignedTransactionData(matchedCredential.dcqlId).deviceSignedTransactionData
 
-                credentialResponse =
+                credentialResponse = if (openId4VPRequest.mandateProposals.isNotEmpty()) {
+                    sdJwtVc.presentWithDelegations(
+                        claimSets = claims,
+                        nonce = openId4VPRequest.nonce,
+                        aud = openId4VPRequest.getSdJwtKbAud(origin),
+                        transactionDataHashes = transaction_data_hashes,
+                        mandateProposals = openId4VPRequest.mandateProposals
+                    )
+                } else {
                     sdJwtVc.present(
                         claims,
                         nonce = openId4VPRequest.nonce,
                         aud = openId4VPRequest.getSdJwtKbAud(origin),
                         transactionDataHashes = transaction_data_hashes
                     )
+                }
             }
 
             is CredentialConfigurationMDoc -> {

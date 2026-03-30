@@ -288,48 +288,96 @@ int main()
             cJSON *transaction_credential_ids = NULL;
             if (transaction_data_list != NULL)
             {
-                if (cJSON_GetArraySize(transaction_data_list) == 1)
+                int td_count = cJSON_GetArraySize(transaction_data_list);
+                for (int td_i = 0; td_i < td_count; td_i++)
                 {
-                    cJSON *transaction_data_encoded = cJSON_GetArrayItem(transaction_data_list, 0);
+                    cJSON *transaction_data_encoded = cJSON_GetArrayItem(transaction_data_list, td_i);
                     char *transaction_data_encoded_str = cJSON_GetStringValue(transaction_data_encoded);
                     char *transaction_data_json;
                     int transaction_data_json_len = B64DecodeURL(transaction_data_encoded_str, &transaction_data_json);
-                    printf("transaction data %s\n", transaction_data_json);
-                    transaction_data = cJSON_Parse(transaction_data_json);
-                    transaction_credential_ids = cJSON_GetObjectItem(transaction_data, "credential_ids");
-                    char *transaction_data_type = cJSON_GetStringValue(cJSON_GetObjectItem(transaction_data, "type"));
-                    if (strcmp(transaction_data_type, "urn:eudi:sca:payment:1") == 0) {
-                        cJSON *payload = cJSON_GetObjectItem(transaction_data, "payload");
-                        merchant_name = cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetObjectItem(payload, "payee"), "name"));
-                        
-                        transaction_amount = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "amount_display"));
+                    printf("transaction data [%d] %s\n", td_i, transaction_data_json);
+                    cJSON *td_item = cJSON_Parse(transaction_data_json);
+                    char *transaction_data_type = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "type"));
 
+                    // Use the first item that provides payment display info as the primary
+                    // Also track credential_ids from the first item for matching
+                    if (td_i == 0) {
+                        transaction_data = td_item;
+                        transaction_credential_ids = cJSON_GetObjectItem(td_item, "credential_ids");
+                    }
+
+                    if (transaction_data_type == NULL) {
+                        // skip malformed item
+                    } else if (strcmp(transaction_data_type, "urn:eudi:sca:payment:1") == 0) {
+                        cJSON *payload = cJSON_GetObjectItem(td_item, "payload");
+                        if (merchant_name == NULL)
+                            merchant_name = cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetObjectItem(payload, "payee"), "name"));
                         if (transaction_amount == NULL) {
-                            double amount = cJSON_GetNumberValue(cJSON_GetObjectItem(payload, "amount"));
-                            int length_for_amount = log10(amount);
-                            char *currency = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "currency"));
-                            int total_length = length_for_amount + 4 + strlen(currency) + 2;
-                            transaction_amount = malloc(length_for_amount + 4 + strlen(currency) + 2);
-                            sprintf(transaction_amount, "%s %f", currency, amount);
-                            transaction_amount[total_length - 1] = '\0';
+                            transaction_amount = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "amount_display"));
+                            if (transaction_amount == NULL) {
+                                double amount = cJSON_GetNumberValue(cJSON_GetObjectItem(payload, "amount"));
+                                int length_for_amount = (int)log10(amount) + 1;
+                                char *currency = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "currency"));
+                                int total_length = length_for_amount + 4 + (currency ? strlen(currency) : 3) + 2;
+                                transaction_amount = malloc(total_length);
+                                sprintf(transaction_amount, "%s %f", currency ? currency : "USD", amount);
+                            }
                         }
-                        printf("transaction amount %s\n", transaction_amount);
-                        
-                        additional_info = cJSON_GetStringValue(cJSON_GetObjectItem(transaction_data, "additional_info"));
+                        if (additional_info == NULL)
+                            additional_info = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "additional_info"));
                     } else if (strcmp(transaction_data_type, "payment_details") == 0) {
-                        merchant_name = cJSON_GetStringValue(cJSON_GetObjectItem(transaction_data, "payee_name"));
-
-                        char *amount = cJSON_GetStringValue(cJSON_GetObjectItem(transaction_data, "payment_amount"));
-                        char *currency = cJSON_GetStringValue(cJSON_GetObjectItem(transaction_data, "payment_currency"));
-                        transaction_amount = malloc(strlen(amount) + strlen(currency) + 2);
-                        sprintf(transaction_amount, "%s %s", currency, amount);
-                        printf("transaction amount %s\n", transaction_amount);
-
-                        additional_info = cJSON_GetStringValue(cJSON_GetObjectItem(transaction_data, "additional_info"));
+                        if (merchant_name == NULL)
+                            merchant_name = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "payee_name"));
+                        if (transaction_amount == NULL) {
+                            char *amount = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "payment_amount"));
+                            char *currency = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "payment_currency"));
+                            if (amount && currency) {
+                                transaction_amount = malloc(strlen(amount) + strlen(currency) + 2);
+                                sprintf(transaction_amount, "%s %s", currency, amount);
+                            }
+                        }
+                        if (additional_info == NULL)
+                            additional_info = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "additional_info"));
+                    } else if (strcmp(transaction_data_type, "com.google.ap2.mandate.cart") == 0) {
+                        // AP2 cart mandate proposal
+                        if (merchant_name == NULL)
+                            merchant_name = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "merchant_name"));
+                        if (additional_info == NULL) {
+                            char *total = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "total"));
+                            char *currency = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "currency"));
+                            char *order_id = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "order_id"));
+                            if (total && currency) {
+                                int ai_len = 32 + (total ? strlen(total) : 4) + (currency ? strlen(currency) : 3) + (order_id ? strlen(order_id) : 0);
+                                additional_info = malloc(ai_len);
+                                if (order_id)
+                                    sprintf(additional_info, "Cart: %s %s (Order %s)", total, currency, order_id);
+                                else
+                                    sprintf(additional_info, "Cart: %s %s", total, currency);
+                            }
+                        }
+                    } else if (strcmp(transaction_data_type, "com.google.ap2.mandate.payment") == 0) {
+                        // AP2 payment mandate proposal
+                        if (merchant_name == NULL)
+                            merchant_name = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "merchant_name"));
+                        if (transaction_amount == NULL) {
+                            char *amount = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "amount"));
+                            char *currency = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "currency"));
+                            if (amount && currency) {
+                                transaction_amount = malloc(strlen(amount) + strlen(currency) + 2);
+                                sprintf(transaction_amount, "%s %s", currency, amount);
+                            }
+                        }
                     } else {
-                        merchant_name = cJSON_GetStringValue(cJSON_GetObjectItem(transaction_data, "merchant_name"));
-                        transaction_amount = cJSON_GetStringValue(cJSON_GetObjectItem(transaction_data, "amount"));
-                        additional_info = cJSON_GetStringValue(cJSON_GetObjectItem(transaction_data, "additional_info"));
+                        // Generic fallback
+                        if (merchant_name == NULL)
+                            merchant_name = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "merchant_name"));
+                        if (transaction_amount == NULL)
+                            transaction_amount = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "amount"));
+                        if (additional_info == NULL)
+                            additional_info = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "additional_info"));
+                    }
+                    if (td_i > 0) {
+                        cJSON_Delete(td_item);
                     }
                 }
             }

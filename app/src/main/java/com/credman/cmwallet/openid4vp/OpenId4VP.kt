@@ -17,6 +17,13 @@ data class TransactionData(
     val data: JSONObject
 )
 
+data class MandateProposal(
+    val type: String,
+    val mandateType: String,
+    val encodedItem: String,
+    val content: org.json.JSONObject
+)
+
 class OpenId4VP(
     var requestJson: JSONObject,
     var clientId: String,
@@ -33,6 +40,7 @@ class OpenId4VP(
 
     val dcqlQuery: JSONObject
     val transactionData: List<TransactionData>
+    val mandateProposals: List<MandateProposal>
     val issuanceOffer: JSONObject?
     val clientMedtadata: JSONObject?
     val responseMode: String?
@@ -99,6 +107,17 @@ class OpenId4VP(
             transactionData = tempList
         } else {
             transactionData = emptyList()
+        }
+
+        mandateProposals = transactionData.filter {
+            it.type.startsWith("com.google.ap2.mandate.")
+        }.map { td ->
+            MandateProposal(
+                type = td.type.removePrefix("com.google.ap2.mandate."),
+                mandateType = td.type,
+                encodedItem = td.encodedData,
+                content = td.data
+            )
         }
 
     }
