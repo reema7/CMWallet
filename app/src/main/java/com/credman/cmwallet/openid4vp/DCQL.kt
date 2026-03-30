@@ -255,13 +255,27 @@ fun matchCredential(credential: JSONObject, credentialStore: JSONObject): List<M
                 } else {
                     return matchedCredentials
                 }
+            }
 
+            "dc+sd-jwt" -> {
+                val vctValues = meta.opt("vct_values") as JSONArray? ?: return matchedCredentials
+                val matched = JSONArray()
+                for (i in 0 until vctValues.length()) {
+                    val vct = vctValues.getString(i)
+                    if (candidatesByFormat.has(vct)) {
+                        val candidates = candidatesByFormat.getJSONArray(vct)
+                        for (j in 0 until candidates.length()) {
+                            matched.put(candidates.getJSONObject(j))
+                        }
+                    }
+                }
+                if (matched.length() == 0) return matchedCredentials
+                candidatesByMeta = matched
             }
 
             else -> return matchedCredentials
         }
     } else {
-        // TODO: fix the fact that doctype is required at the moment.
         return matchedCredentials
     }
 
@@ -297,6 +311,17 @@ fun matchCredential(credential: JSONObject, credentialStore: JSONObject): List<M
                                         )
                                     )
                                 }
+                            }
+                        }
+                        "dc+sd-jwt" -> {
+                            require(claim.has("path")) { "sd-jwt claim must contain path" }
+                            val path = claim.getJSONArray("path")
+                            val claimName = path.getString(path.length() - 1)
+                            val paths = candidate.optJSONObject("paths")
+                            if (paths != null && paths.has(claimName)) {
+                                matchedCredential.matchedClaims.add(
+                                    MatchedMDocClaim("", claimName)
+                                )
                             }
                         }
                     }
