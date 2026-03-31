@@ -338,33 +338,55 @@ int main()
                         }
                         if (additional_info == NULL)
                             additional_info = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "additional_info"));
-                    } else if (strcmp(transaction_data_type, "com.google.ap2.mandate.cart") == 0) {
-                        // AP2 cart mandate proposal
-                        if (merchant_name == NULL)
-                            merchant_name = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "merchant_name"));
-                        if (additional_info == NULL) {
-                            char *total = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "total"));
-                            char *currency = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "currency"));
-                            char *order_id = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "order_id"));
-                            if (total && currency) {
-                                int ai_len = 32 + (total ? strlen(total) : 4) + (currency ? strlen(currency) : 3) + (order_id ? strlen(order_id) : 0);
-                                additional_info = malloc(ai_len);
-                                if (order_id)
-                                    sprintf(additional_info, "Cart: %s %s (Order %s)", total, currency, order_id);
-                                else
-                                    sprintf(additional_info, "Cart: %s %s", total, currency);
-                            }
-                        }
-                    } else if (strcmp(transaction_data_type, "com.google.ap2.mandate.payment") == 0) {
-                        // AP2 payment mandate proposal
-                        if (merchant_name == NULL)
-                            merchant_name = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "merchant_name"));
-                        if (transaction_amount == NULL) {
-                            char *amount = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "amount"));
-                            char *currency = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "currency"));
-                            if (amount && currency) {
-                                transaction_amount = malloc(strlen(amount) + strlen(currency) + 2);
-                                sprintf(transaction_amount, "%s %s", currency, amount);
+                    } else if (strcmp(transaction_data_type, "delegate") == 0) {
+                        // AP2 delegate proposal: wallet will issue a new mandate SD-JWT
+                        // Parse delegate_payload[0] for display info
+                        cJSON *delegate_payload_arr = cJSON_GetObjectItem(td_item, "delegate_payload");
+                        if (delegate_payload_arr != NULL && cJSON_GetArraySize(delegate_payload_arr) > 0) {
+                            cJSON *dp = cJSON_GetArrayItem(delegate_payload_arr, 0);
+                            char *vct = cJSON_GetStringValue(cJSON_GetObjectItem(dp, "vct"));
+                            if (vct != NULL && strncmp(vct, "mandate.payment", 15) == 0) {
+                                // Open payment mandate: look in constraints array
+                                cJSON *constraints = cJSON_GetObjectItem(dp, "constraints");
+                                if (constraints != NULL) {
+                                    int nc = cJSON_GetArraySize(constraints);
+                                    for (int ci = 0; ci < nc; ci++) {
+                                        cJSON *c = cJSON_GetArrayItem(constraints, ci);
+                                        char *ctype = cJSON_GetStringValue(cJSON_GetObjectItem(c, "type"));
+                                        if (ctype && strcmp(ctype, "payment.amount") == 0 && transaction_amount == NULL) {
+                                            char *max_val = cJSON_GetStringValue(cJSON_GetObjectItem(c, "max"));
+                                            char *currency = cJSON_GetStringValue(cJSON_GetObjectItem(c, "currency"));
+                                            if (max_val && currency) {
+                                                transaction_amount = malloc(strlen(max_val) + strlen(currency) + 8);
+                                                sprintf(transaction_amount, "%s %s (max)", currency, max_val);
+                                            }
+                                        }
+                                        if (ctype && strcmp(ctype, "payment.allowed_payees") == 0 && merchant_name == NULL) {
+                                            cJSON *payees = cJSON_GetObjectItem(c, "allowed");
+                                            if (payees && cJSON_GetArraySize(payees) > 0)
+                                                merchant_name = cJSON_GetStringValue(cJSON_GetArrayItem(payees, 0));
+                                        }
+                                    }
+                                }
+                                // Closed payment mandate: flat fields
+                                if (transaction_amount == NULL) {
+                                    char *amount = cJSON_GetStringValue(cJSON_GetObjectItem(dp, "amount"));
+                                    char *currency = cJSON_GetStringValue(cJSON_GetObjectItem(dp, "currency"));
+                                    if (amount && currency) {
+                                        transaction_amount = malloc(strlen(amount) + strlen(currency) + 2);
+                                        sprintf(transaction_amount, "%s %s", currency, amount);
+                                    }
+                                }
+                                if (merchant_name == NULL)
+                                    merchant_name = cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetObjectItem(dp, "payee"), "name"));
+                            } else if (vct != NULL && strncmp(vct, "mandate.checkout", 16) == 0) {
+                                // Checkout mandate: show checkout_hash as display info
+                                char *checkout_hash = cJSON_GetStringValue(cJSON_GetObjectItem(dp, "checkout_hash"));
+                                if (checkout_hash && additional_info == NULL) {
+                                    int ai_len = 32 + strlen(checkout_hash);
+                                    additional_info = malloc(ai_len);
+                                    snprintf(additional_info, ai_len, "Checkout: %.16s...", checkout_hash);
+                                }
                             }
                         }
                     } else {

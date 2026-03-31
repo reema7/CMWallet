@@ -162,26 +162,54 @@ class SdJwt(
         return sdJwt + kbJwt
     }
 
+    /**
+     * Produces a dSD-JWT chain for the HITL AP2 mandate flow.
+     *
+     * The DPC SD-JWT is presented normally (no KB-JWT from the wallet). Instead, for each
+     * [DelegateProposal] the wallet produces a **KB-SD-JWT**: a compact JWT that simultaneously
+     * serves as the KB-JWT for the preceding SD-JWT in the chain AND carries the mandate payload
+     * (vct, cnf.jwk=agent_key, constraints / checkout_hash, etc.) as its own JWT claims.
+     *
+     * Chain structure (all parts joined with `~`):
+     * ```
+     *   dpc_issuer_jwt ~ dpc_disc1 ~ ... ~ checkout_discs ~ KB-SD-JWT_checkout
+     *                              ~ payment_discs ~ KB-SD-JWT_payment ~
+     * ```
+     * - Every KB-SD-JWT is signed with the holder's **device key** (cnf key of the preceding SD-JWT).
+     * - `sd_hash` in each KB-SD-JWT covers everything that preceded it (base SD-JWT + earlier parts).
+     * - `cnf.jwk` in each KB-SD-JWT's delegate payload = agent's public key (delegatee).
+     * - Trailing `~` signals no agent KB-JWT yet; the agent appends that when presenting to a verifier.
+     *
+     * Verification (per spec):
+     *  1. Verify DPC SD-JWT using issuer key; KB = KB-SD-JWT_checkout.
+     *  2. For each KB-SD-JWT: verify as SD-JWT+KB using delegate payload as JWT payload and the cnf
+     *     key from the preceding SD-JWT. Next KB-SD-JWT (or agent's KB-JWT) is the KB.
+     *  3. Final KB-SD-JWT includes transaction binding data (nonce, aud, transaction_data_hashes).
+     */
     @OptIn(ExperimentalSerializationApi::class)
     fun presentWithDelegations(
         claimSets: JSONArray?,
         nonce: String,
         aud: String,
         transactionDataHashes: Map<String, List<ByteArray>>,
-        mandateProposals: List<com.credman.cmwallet.openid4vp.MandateProposal>
+        delegateProposals: List<com.credman.cmwallet.openid4vp.DelegateProposal>
     ): String {
-        // Build SD-JWT components (issuer_jwt + selective disclosures) — identical to present()
-        val sdJwtComponents = mutableListOf(issuerJwt)
+        require(delegateProposals.isNotEmpty()) {
+            "Use present() when there are no delegate proposals"
+        }
+
+        // ── Step 1: select DPC disclosures (same logic as present()) ──────────────────
+        val selectedDisclosures = mutableListOf<String>()
         if (claimSets == null) {
-            sdJwtComponents.addAll(disclosures)
+            selectedDisclosures.addAll(disclosures)
         } else {
-            var claimSetMatched = true
-            for (i in 0..<claimSets.length()) {
-                claimSetMatched = true
+            var matched = false
+            outer@ for (i in 0..<claimSets.length()) {
                 val claimSet = claimSets[i] as JSONArray
                 val ret = mutableListOf<String>()
+                var ok = true
                 for (claimIdx in 0 until claimSet.length()) {
-                    val claim = claimSet.getJSONObject(claimIdx)!!
+                    val claim = claimSet.getJSONObject(claimIdx)
                     val path = claim.getJSONArray("path")
                     var sd = verifiedResult.sdMap
                     val sds = mutableListOf<JSONObject>()
@@ -190,106 +218,103 @@ class SdJwt(
                         if (sd.has(currPath)) {
                             sd = sd.getJSONObject(currPath)
                             sds.add(JSONObject(sd.toString()))
-                        } else {
-                            claimSetMatched = false
-                            break
-                        }
+                        } else { ok = false; break }
                     }
-                    if (claimSetMatched) {
-                        addDisclosuresToPresentation(sd, ret)
-                        if (sds.size > 1) {
-                            for (k in 0..<sds.size - 1) {
-                                val currSd = sds[k]
-                                if (currSd.has("_sd")) {
-                                    val digest = currSd.getString("_sd")
-                                    val disclosure = verifiedResult.digestDisclosureMap[digest]!!
-                                    ret.add(disclosure)
-                                }
+                    if (!ok) break
+                    addDisclosuresToPresentation(sd, ret)
+                    if (sds.size > 1) {
+                        for (k in 0..<sds.size - 1) {
+                            val currSd = sds[k]
+                            if (currSd.has("_sd")) {
+                                val digest = currSd.getString("_sd")
+                                ret.add(verifiedResult.digestDisclosureMap[digest]!!)
                             }
                         }
-                    } else {
-                        break
                     }
                 }
-                if (claimSetMatched) {
-                    sdJwtComponents.addAll(ret)
-                    break
-                }
+                if (ok) { selectedDisclosures.addAll(ret); matched = true; break@outer }
             }
-            require(claimSetMatched) { "Could not match against any claim sets." }
+            require(matched) { "Could not match against any claim sets." }
         }
 
-        // Base SD-JWT: issuer_jwt~disc1~...~ — sd_hash computed over this, NOT including delegations
-        val sdJwt = sdJwtComponents.joinToString("~", postfix = "~")
+        // ── Step 2: build the running component list ──────────────────────────────────
+        // Parts accumulate here; they are joined with `~` to form the chain.
+        val parts = mutableListOf<String>()
+        parts.add(issuerJwt)
+        parts.addAll(selectedDisclosures)
 
-        // Generate one delegation JWT per mandate proposal, signed by the holder device key
-        val delegationJwts = mandateProposals.map { mandate ->
-            // Holder public key thumbprint from cnf.jwk embedded in the issuer JWT
-            val cnfJwk = verifiedResult.processedJwt.optJSONObject("cnf")?.optJSONObject("jwk")
-            val holderThumbprint = if (cnfJwk != null) {
-                val canonical = org.json.JSONObject().apply {
-                    put("crv", cnfJwk.optString("crv", "P-256"))
-                    put("kty", cnfJwk.optString("kty", "EC"))
-                    put("x", cnfJwk.optString("x", ""))
-                    put("y", cnfJwk.optString("y", ""))
-                }.toString()
-                val md0 = MessageDigest.getInstance("SHA-256")
-                md0.digest(canonical.toByteArray()).toBase64UrlNoPadding()
-            } else {
-                ""
-            }
-            val txDataHash = MessageDigest.getInstance("SHA-256")
-                .digest(mandate.encodedItem.encodeToByteArray())
+        // ── Step 3: for each delegate proposal, append its disclosures then a KB-SD-JWT ─
+        val isLast = { idx: Int -> idx == delegateProposals.lastIndex }
+
+        for ((idx, proposal) in delegateProposals.withIndex()) {
+            // Append the delegate's own selective disclosures (for claims like checkout_jwt)
+            parts.addAll(proposal.delegateDisclosures)
+
+            // sd_hash covers the entire preceding chain: parts.joinToString("~") + "~"
+            val precedingChain = parts.joinToString("~", postfix = "~")
+            val sdHash = MessageDigest.getInstance("SHA-256")
+                .digest(precedingChain.encodeToByteArray())
                 .toBase64UrlNoPadding()
-            val delegHeader = buildJsonObject {
-                put("typ", "sd-jwt-delegation")
+
+            // Build KB-SD-JWT header: typ="kb+jwt" (it IS a KB-JWT for the preceding SD-JWT)
+            val kbSdHeader = buildJsonObject {
+                put("typ", "kb+jwt")
                 put("alg", "ES256")
             }
-            val delegPayload = buildJsonObject {
-                put("iss", holderThumbprint)
+
+            // Build KB-SD-JWT payload = delegate_payload claims + standard KB fields
+            // The delegate_payload already carries: vct, cnf.jwk (agent key), constraints etc.
+            val kbSdPayload = buildJsonObject {
+                // KB standard fields
                 put("iat", Instant.now().epochSecond)
-                put("exp", Instant.now().epochSecond + 300L)
-                put("mandate_type", mandate.type)
                 put("aud", aud)
                 put("nonce", nonce)
-                put("constraints", mandate.content.toString())
-                put("transaction_data_hash", txDataHash)
-            }
-            createJWTES256(delegHeader, delegPayload, holderKey)
-        }
+                put("sd_hash", sdHash)
 
-        // sd_hash covers issuer_jwt~disclosures~ only
-        val sdHash = MessageDigest.getInstance("SHA-256")
-            .digest(sdJwt.encodeToByteArray())
-            .toBase64UrlNoPadding()
+                // Mandate / delegate fields from the proposal (verbatim copy)
+                for (key in proposal.delegatePayload.keys()) {
+                    put(key, anyToJsonElement(proposal.delegatePayload.get(key)))
+                }
 
-        // KB-JWT
-        val kbHeader = buildJsonObject {
-            put("typ", "kb+jwt")
-            put("alg", "ES256")
-        }
-        val kbPayload = buildJsonObject {
-            put("iat", Instant.now().epochSecond)
-            put("aud", aud)
-            put("nonce", nonce)
-            put("sd_hash", sdHash)
-            if (transactionDataHashes.isNotEmpty()) {
-                for (entry in transactionDataHashes) {
-                    putJsonArray(entry.key) {
-                        entry.value.forEach { data -> add(data.toBase64UrlNoPadding()) }
+                // Transaction data hashes go in the LAST KB-SD-JWT only
+                if (isLast(idx) && transactionDataHashes.isNotEmpty()) {
+                    for (entry in transactionDataHashes) {
+                        putJsonArray(entry.key) {
+                            entry.value.forEach { data -> add(data.toBase64UrlNoPadding()) }
+                        }
                     }
                 }
             }
-        }
-        val kbJwt = createJWTES256(kbHeader, kbPayload, holderKey)
 
-        // Final: issuer_jwt~disc1~...~delegation1~delegation2~kb_jwt
-        return if (delegationJwts.isEmpty()) {
-            sdJwt + kbJwt
-        } else {
-            sdJwt + delegationJwts.joinToString("~", postfix = "~") + kbJwt
+            val kbSdJwt = createJWTES256(kbSdHeader, kbSdPayload, holderKey)
+            parts.add(kbSdJwt)
         }
+
+        // ── Step 4: return chain with trailing ~ (no agent KB-JWT yet) ────────────────
+        return parts.joinToString("~", postfix = "~")
     }
+
+    /** Converts an org.json value to a kotlinx.serialization JsonElement. */
+    private fun anyToJsonElement(v: Any?): kotlinx.serialization.json.JsonElement = when (v) {
+        null, JSONObject.NULL -> kotlinx.serialization.json.JsonNull
+        is Boolean -> kotlinx.serialization.json.JsonPrimitive(v)
+        is Int -> kotlinx.serialization.json.JsonPrimitive(v)
+        is Long -> kotlinx.serialization.json.JsonPrimitive(v)
+        is Double -> kotlinx.serialization.json.JsonPrimitive(v)
+        is Float -> kotlinx.serialization.json.JsonPrimitive(v)
+        is String -> kotlinx.serialization.json.JsonPrimitive(v)
+        is JSONObject -> {
+            val map = mutableMapOf<String, kotlinx.serialization.json.JsonElement>()
+            for (k in v.keys()) map[k] = anyToJsonElement(v.get(k))
+            kotlinx.serialization.json.JsonObject(map)
+        }
+        is JSONArray -> {
+            val list = (0 until v.length()).map { anyToJsonElement(v.get(it)) }
+            kotlinx.serialization.json.JsonArray(list)
+        }
+        else -> kotlinx.serialization.json.JsonPrimitive(v.toString())
+    }
+
 }
 
 class VerificationResult(

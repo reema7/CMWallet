@@ -38,6 +38,7 @@ import com.credman.cmwallet.mdoc.webOriginOrAppOrigin
 import com.credman.cmwallet.openid4vci.data.CredentialConfigurationMDoc
 import com.credman.cmwallet.openid4vci.data.CredentialConfigurationSdJwtVc
 import com.credman.cmwallet.openid4vci.data.CredentialConfigurationUnknownFormat
+import com.credman.cmwallet.openid4vp.DelegateProposal
 import com.credman.cmwallet.openid4vp.OpenId4VP
 import com.credman.cmwallet.openid4vp.OpenId4VP.Companion.IDENTIFIERS_1_0
 import com.credman.cmwallet.openid4vp.OpenId4VP.Companion.IDENTIFIER_DRAFT_24
@@ -80,13 +81,13 @@ fun createOpenID4VPResponse(
                 val transaction_data_hashes =
                     openId4VPRequest.generateDeviceSignedTransactionData(matchedCredential.dcqlId).deviceSignedTransactionData
 
-                credentialResponse = if (openId4VPRequest.mandateProposals.isNotEmpty()) {
+                credentialResponse = if (openId4VPRequest.delegateProposals.isNotEmpty()) {
                     sdJwtVc.presentWithDelegations(
                         claimSets = claims,
                         nonce = openId4VPRequest.nonce,
                         aud = openId4VPRequest.getSdJwtKbAud(origin),
                         transactionDataHashes = transaction_data_hashes,
-                        mandateProposals = openId4VPRequest.mandateProposals
+                        delegateProposals = openId4VPRequest.delegateProposals
                     )
                 } else {
                     sdJwtVc.present(

@@ -17,11 +17,12 @@ data class TransactionData(
     val data: JSONObject
 )
 
-data class MandateProposal(
-    val type: String,
-    val mandateType: String,
-    val encodedItem: String,
-    val content: org.json.JSONObject
+data class DelegateProposal(
+    val encodedItem: String,      // original base64url item from transaction_data array
+    val format: String,            // e.g. "dc+sd-jwt"
+    val delegatePayload: JSONObject, // proposed JWT claims (includes vct, cnf.jwk, mandate fields, _sd if any)
+    val delegateDisclosures: List<String>, // pre-computed disclosure strings
+    val credentialIds: List<String>  // credential_ids this mandate is scoped to
 )
 
 class OpenId4VP(
@@ -40,7 +41,7 @@ class OpenId4VP(
 
     val dcqlQuery: JSONObject
     val transactionData: List<TransactionData>
-    val mandateProposals: List<MandateProposal>
+    val delegateProposals: List<DelegateProposal>
     val issuanceOffer: JSONObject?
     val clientMedtadata: JSONObject?
     val responseMode: String?
@@ -109,14 +110,30 @@ class OpenId4VP(
             transactionData = emptyList()
         }
 
-        mandateProposals = transactionData.filter {
-            it.type.startsWith("com.google.ap2.mandate.")
+        delegateProposals = transactionData.filter {
+            it.type == "delegate"
         }.map { td ->
-            MandateProposal(
-                type = td.type.removePrefix("com.google.ap2.mandate."),
-                mandateType = td.type,
+            val payloadArr = td.data.optJSONArray("delegate_payload")
+            val payload = if (payloadArr != null && payloadArr.length() > 0)
+                payloadArr.getJSONObject(0)
+            else
+                JSONObject()
+            val disclosuresArr = td.data.optJSONArray("delegate_disclosures")
+            val disclosures = if (disclosuresArr != null)
+                (0 until disclosuresArr.length()).map { disclosuresArr.getString(it) }
+            else
+                emptyList()
+            val credIdsArr = td.data.optJSONArray("credential_ids")
+            val credIds = if (credIdsArr != null)
+                (0 until credIdsArr.length()).map { credIdsArr.getString(it) }
+            else
+                emptyList()
+            DelegateProposal(
                 encodedItem = td.encodedData,
-                content = td.data
+                format = td.data.optString("format", "dc+sd-jwt"),
+                delegatePayload = payload,
+                delegateDisclosures = disclosures,
+                credentialIds = credIds
             )
         }
 
