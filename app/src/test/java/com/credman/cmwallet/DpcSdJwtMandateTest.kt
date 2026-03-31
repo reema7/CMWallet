@@ -376,6 +376,206 @@ class DpcSdJwtMandateTest {
         println("  KB-SD-JWT_2 (${vcts[1]}): ${kbSdJwts[1].take(40)}...")
     }  // end test
 
+    // ── Incremental presentability tests ──────────────────────────────────────
+    //
+    // The chain structure:
+    //   dpc_jwt ~ dpc_discs ~ KB-SD-JWT_checkout ~ KB-SD-JWT_payment ~
+    //
+    // enables TWO independent presentations (agent appends its own KB-JWT to a prefix):
+    //
+    //   Prefix 1 (to merchant/checkout verifier):
+    //     dpc_jwt ~ dpc_discs ~ KB-SD-JWT_checkout ~ [agent_kb_jwt]
+    //
+    //   Prefix 2 (to payment network — carries full consent chain):
+    //     dpc_jwt ~ dpc_discs ~ KB-SD-JWT_checkout ~ KB-SD-JWT_payment ~ [agent_kb_jwt]
+    //
+    // The agent_kb_jwt in each case has sd_hash covering the chain up to (not including) itself.
+    // KB-SD-JWT_checkout's sd_hash proves it was signed over just the DPC.
+    // KB-SD-JWT_payment's sd_hash proves it was signed over DPC + checkout mandate — linking them.
+
+    /**
+     * Simulates the agent appending a KB-JWT to a chain prefix.
+     * In production the agent signs with its private key; here we use the holder key as a stand-in.
+     */
+    private fun agentAddKbJwt(chainPrefix: String, agentNonce: String, agentAud: String): String {
+        require(chainPrefix.endsWith("~")) { "Chain prefix must end with ~" }
+        val sdHash = sha256b64url(chainPrefix)
+        val header = """{"typ":"kb+jwt","alg":"ES256"}"""
+        val payload = """{"iat":${System.currentTimeMillis()/1000},"aud":"$agentAud","nonce":"$agentNonce","sd_hash":"$sdHash"}"""
+        // In tests we use the holder key as a proxy for the agent key (both are EC P-256)
+        val holderKey = java.security.KeyFactory.getInstance("EC")
+            .generatePrivate(java.security.spec.PKCS8EncodedKeySpec(
+                JBase64.getUrlDecoder().decode(holderKeyNormalized.padEnd(
+                    holderKeyNormalized.length + (4 - holderKeyNormalized.length % 4) % 4, '='
+                ))
+            ))
+        val h64 = JBase64.getUrlEncoder().withoutPadding().encodeToString(header.toByteArray())
+        val p64 = JBase64.getUrlEncoder().withoutPadding().encodeToString(payload.toByteArray())
+        val sig = java.security.Signature.getInstance("SHA256withECDSA").apply {
+            initSign(holderKey)
+            update("$h64.$p64".toByteArray())
+        }.sign()
+        // Convert DER signature to raw R||S (JWS format)
+        val r = sig.copyOfRange(4, 4 + sig[3].toInt())
+        val s = sig.copyOfRange(4 + sig[3].toInt() + 2, sig.size)
+        val rawR = if (r.size > 32) r.copyOfRange(r.size - 32, r.size) else r.copyOf(32).also { r.copyInto(it, 32 - r.size) }
+        val rawS = if (s.size > 32) s.copyOfRange(s.size - 32, s.size) else s.copyOf(32).also { s.copyInto(it, 32 - s.size) }
+        val rawSig = JBase64.getUrlEncoder().withoutPadding().encodeToString(rawR + rawS)
+        return chainPrefix + "$h64.$p64.$rawSig"
+    }
+
+    @Test
+    fun `checkout mandate is independently presentable to merchant`() {
+        val proposals = listOf(
+            DelegateProposal("e1", "dc+sd-jwt", checkoutPayload(), emptyList(), listOf(DPC_CRED_ID)),
+            DelegateProposal("e2", "dc+sd-jwt", paymentPayload(),  emptyList(), listOf(DPC_CRED_ID))
+        )
+        val chain = SdJwt(dpcCredential, holderKeyNormalized).presentWithDelegations(
+            null, TEST_NONCE, TEST_AUD, emptyMap(), proposals
+        )
+        val parts = chain.split("~").dropLast(1)
+
+        // Checkout KB-SD-JWT is at the first compact-JWT position after the issuer JWT
+        val kbPos = parts.indices.first { it > 0 && parts[it].split(".").size == 3 }
+        val checkoutKbSdJwt = parts[kbPos]
+
+        // Agent builds: dpc_jwt ~ dpc_discs ~ KB-SD-JWT_checkout ~
+        val checkoutPrefix = parts.subList(0, kbPos + 1).joinToString("~", postfix = "~")
+
+        // Agent appends its KB-JWT for presentation to a merchant
+        val merchantNonce = "merchant-nonce-xyz"
+        val merchantAud   = "origin:https://merchant.example"
+        val presentedToMerchant = agentAddKbJwt(checkoutPrefix, merchantNonce, merchantAud)
+
+        // Verify structure: ends with a compact JWT (agent KB-JWT)
+        assertFalse("Full chain must not end with ~", presentedToMerchant.endsWith("~"))
+        val pParts = presentedToMerchant.split("~").filter { it.isNotEmpty() }
+        assertEquals("Agent KB-JWT must be 3-part compact JWT", 3, pParts.last().split(".").size)
+
+        // Verify agent KB-JWT's sd_hash covers exactly the checkout prefix
+        val (_, agentKbPayload) = decodeJwt(pParts.last())
+        val expectedSdHash = sha256b64url(checkoutPrefix)
+        assertEquals("sd_hash in agent KB-JWT must cover checkout prefix", expectedSdHash, agentKbPayload.getString("sd_hash"))
+        assertEquals(merchantNonce, agentKbPayload.getString("nonce"))
+        assertEquals(merchantAud,   agentKbPayload.getString("aud"))
+
+        // The KB-SD-JWT_checkout payload is still intact with mandate content
+        val (_, checkoutPayloadJson) = decodeJwt(checkoutKbSdJwt)
+        assertEquals("mandate.checkout.1", checkoutPayloadJson.getString("vct"))
+
+        println("✓ Checkout-only presentation to merchant:")
+        println("  Chain parts: ${pParts.size}  (issuer_jwt + ${pParts.size - 3} dpc_discs + KB-SD-JWT_checkout + agent_kb_jwt)")
+    }
+
+    @Test
+    fun `payment mandate presentation to payment network carries full consent chain`() {
+        val proposals = listOf(
+            DelegateProposal("e1", "dc+sd-jwt", checkoutPayload(), emptyList(), listOf(DPC_CRED_ID)),
+            DelegateProposal("e2", "dc+sd-jwt", paymentPayload(),  emptyList(), listOf(DPC_CRED_ID))
+        )
+        val chain = SdJwt(dpcCredential, holderKeyNormalized).presentWithDelegations(
+            null, TEST_NONCE, TEST_AUD, emptyMap(), proposals
+        )
+        val parts = chain.split("~").dropLast(1)
+
+        // Full chain prefix = everything the wallet produced (both KB-SD-JWTs)
+        val fullPrefix = parts.joinToString("~", postfix = "~")
+
+        val paymentNonce = "payment-network-nonce-abc"
+        val paymentAud   = "origin:https://paymentnetwork.example"
+        val presentedToNetwork = agentAddKbJwt(fullPrefix, paymentNonce, paymentAud)
+
+        assertFalse("Must not end with ~", presentedToNetwork.endsWith("~"))
+        val pParts = presentedToNetwork.split("~").filter { it.isNotEmpty() }
+
+        val (_, agentKbPayload) = decodeJwt(pParts.last())
+        val expectedSdHash = sha256b64url(fullPrefix)
+        assertEquals("sd_hash must cover full chain including checkout KB-SD-JWT", expectedSdHash, agentKbPayload.getString("sd_hash"))
+        assertEquals(paymentNonce, agentKbPayload.getString("nonce"))
+        assertEquals(paymentAud,   agentKbPayload.getString("aud"))
+
+        // Both KB-SD-JWTs are present
+        val kbSdJwts = pParts.drop(1).dropLast(1).filter { it.split(".").size == 3 }
+        assertEquals("Full chain must carry both KB-SD-JWTs", 2, kbSdJwts.size)
+        val vcts = kbSdJwts.map { decodeJwt(it).second.getString("vct") }
+        assertTrue(vcts.contains("mandate.checkout.1"))
+        assertTrue(vcts.contains("mandate.payment"))
+
+        println("✓ Full chain presentation to payment network:")
+        println("  Chain parts: ${pParts.size}  (issuer_jwt + dpc_discs + KB-SD-JWT_checkout + KB-SD-JWT_payment + agent_kb_jwt)")
+    }
+
+    @Test
+    fun `payment mandate sd_hash proves it was signed over DPC and checkout mandate together`() {
+        // This test verifies the KEY incremental security property:
+        // KB-SD-JWT_payment's sd_hash commits to the checkout mandate being present.
+        // An attacker cannot strip KB-SD-JWT_checkout and still have a valid payment mandate.
+        val proposals = listOf(
+            DelegateProposal("e1", "dc+sd-jwt", checkoutPayload("specific-checkout-hash"), emptyList(), listOf(DPC_CRED_ID)),
+            DelegateProposal("e2", "dc+sd-jwt", paymentPayload(), emptyList(), listOf(DPC_CRED_ID))
+        )
+        val chain = SdJwt(dpcCredential, holderKeyNormalized).presentWithDelegations(
+            null, TEST_NONCE, TEST_AUD, emptyMap(), proposals
+        )
+        val parts = chain.split("~").dropLast(1)
+        val kbPositions = parts.indices.filter { it > 0 && parts[it].split(".").size == 3 }
+        assertEquals(2, kbPositions.size)
+
+        val pos1 = kbPositions[0]  // KB-SD-JWT_checkout
+        val pos2 = kbPositions[1]  // KB-SD-JWT_payment
+
+        val (_, p2) = decodeJwt(parts[pos2])
+        val actualSdHash2 = p2.getString("sd_hash")
+
+        // sd_hash in payment mandate = SHA256(dpc_jwt~dpc_discs~KB-SD-JWT_checkout~)
+        // i.e. it includes KB-SD-JWT_checkout — proving the two mandates are linked
+        val chainWithCheckout = parts.subList(0, pos2).joinToString("~", postfix = "~")
+        val expectedSdHash2 = sha256b64url(chainWithCheckout)
+        assertEquals(expectedSdHash2, actualSdHash2)
+
+        // Confirm it's DIFFERENT from sd_hash that would result from stripping KB-SD-JWT_checkout
+        val chainWithoutCheckout = (parts.subList(0, pos1) + parts.subList(pos1 + 1, pos2))
+            .joinToString("~", postfix = "~")
+        val strippedSdHash = sha256b64url(chainWithoutCheckout)
+        assertNotEquals(
+            "Payment mandate sd_hash must change if checkout mandate is stripped — cannot be used independently",
+            strippedSdHash, actualSdHash2
+        )
+
+        println("✓ Payment mandate is cryptographically bound to checkout mandate via sd_hash")
+        println("  Checkout KB-SD-JWT is part of the commitment — cannot be stripped")
+    }
+
+    @Test
+    fun `incremental chains have different sd_hash commitments`() {
+        val proposals = listOf(
+            DelegateProposal("e1", "dc+sd-jwt", checkoutPayload(), emptyList(), listOf(DPC_CRED_ID)),
+            DelegateProposal("e2", "dc+sd-jwt", paymentPayload(),  emptyList(), listOf(DPC_CRED_ID))
+        )
+        val chain = SdJwt(dpcCredential, holderKeyNormalized).presentWithDelegations(
+            null, TEST_NONCE, TEST_AUD, emptyMap(), proposals
+        )
+        val parts = chain.split("~").dropLast(1)
+        val kbPositions = parts.indices.filter { it > 0 && parts[it].split(".").size == 3 }
+
+        val (_, kb1Payload) = decodeJwt(parts[kbPositions[0]])
+        val (_, kb2Payload) = decodeJwt(parts[kbPositions[1]])
+
+        // sd_hash1 covers DPC only; sd_hash2 covers DPC + checkout mandate
+        // They must be different — each mandate commits to a strictly larger set of content
+        assertNotEquals(
+            "Incremental KB-SD-JWTs must have different sd_hash values",
+            kb1Payload.getString("sd_hash"),
+            kb2Payload.getString("sd_hash")
+        )
+
+        // sd_hash2 implicitly contains sd_hash1's content (subset relationship)
+        val prefix1 = parts.subList(0, kbPositions[0]).joinToString("~", postfix = "~")
+        val prefix2 = parts.subList(0, kbPositions[1]).joinToString("~", postfix = "~")
+        assertTrue("Prefix 2 must contain prefix 1 as a substring", prefix2.startsWith(prefix1))
+    }
+
+
     companion object {
         /**
          * DPC SD-JWT credential from databasenew.json (dpc_v3_2_sdjwt).
