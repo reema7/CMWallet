@@ -103,19 +103,25 @@ class DpcSdJwtMandateTest {
     }
 
     private fun encodeDelegateItem(
-        delegatePayload: JSONObject,
+        delegatePayloads: List<JSONObject>,
         delegateDisclosures: List<String> = emptyList()
     ): String {
         val item = JSONObject().apply {
             put("type", "delegate")
             put("format", "dc+sd-jwt")
             put("credential_ids", JSONArray().put(DPC_CRED_ID))
-            put("delegate_payload", JSONArray().put(delegatePayload))
+            put("delegate_payload", JSONArray().apply { delegatePayloads.forEach { put(it) } })
             put("delegate_disclosures", JSONArray().apply { delegateDisclosures.forEach { put(it) } })
         }
         return JBase64.getUrlEncoder().withoutPadding()
             .encodeToString(item.toString().toByteArray())
     }
+
+    // Convenience overload for single payload (backward compat in tests)
+    private fun encodeDelegateItem(
+        delegatePayload: JSONObject,
+        delegateDisclosures: List<String> = emptyList()
+    ) = encodeDelegateItem(listOf(delegatePayload), delegateDisclosures)
 
     private fun oid4vpRequest(txItems: List<String> = emptyList()) = JSONObject().apply {
         put("nonce", TEST_NONCE)
@@ -151,11 +157,9 @@ class DpcSdJwtMandateTest {
 
     @Test
     fun `OpenId4VP correctly parses two delegate proposals`() {
-        val items = listOf(
-            encodeDelegateItem(checkoutPayload()),
-            encodeDelegateItem(paymentPayload())
-        )
-        val oid4vp = OpenId4VP(oid4vpRequest(items), TEST_AUD, "openid4vp-v1-qrcode")
+        // Both mandate payloads in ONE transaction_data item, inside delegate_payload[]
+        val item = encodeDelegateItem(listOf(checkoutPayload(), paymentPayload()))
+        val oid4vp = OpenId4VP(oid4vpRequest(listOf(item)), TEST_AUD, "openid4vp-v1-qrcode")
 
         assertEquals(2, oid4vp.delegateProposals.size)
         with(oid4vp.delegateProposals[0]) {

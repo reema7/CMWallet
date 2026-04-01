@@ -110,16 +110,18 @@ class OpenId4VP(
             transactionData = emptyList()
         }
 
+        // Each delegate transaction_data item may carry multiple payloads in delegate_payload[].
+        // We create one DelegateProposal per payload entry.
+        // delegate_disclosures are item-level; they are matched to the payload whose _sd digests
+        // reference them. For simplicity, all disclosures are attached to the first payload —
+        // the wallet inserts them into the chain before that payload's KB-SD-JWT.
         delegateProposals = transactionData.filter {
             it.type == "delegate"
-        }.map { td ->
+        }.flatMap { td ->
             val payloadArr = td.data.optJSONArray("delegate_payload")
-            val payload = if (payloadArr != null && payloadArr.length() > 0)
-                payloadArr.getJSONObject(0)
-            else
-                JSONObject()
+                ?: return@flatMap emptyList()
             val disclosuresArr = td.data.optJSONArray("delegate_disclosures")
-            val disclosures = if (disclosuresArr != null)
+            val allDisclosures = if (disclosuresArr != null)
                 (0 until disclosuresArr.length()).map { disclosuresArr.getString(it) }
             else
                 emptyList()
@@ -128,13 +130,19 @@ class OpenId4VP(
                 (0 until credIdsArr.length()).map { credIdsArr.getString(it) }
             else
                 emptyList()
-            DelegateProposal(
-                encodedItem = td.encodedData,
-                format = td.data.optString("format", "dc+sd-jwt"),
-                delegatePayload = payload,
-                delegateDisclosures = disclosures,
-                credentialIds = credIds
-            )
+            val format = td.data.optString("format", "dc+sd-jwt")
+
+            (0 until payloadArr.length()).map { i ->
+                DelegateProposal(
+                    encodedItem = td.encodedData,
+                    format = format,
+                    delegatePayload = payloadArr.getJSONObject(i),
+                    // delegate_disclosures belong to the first payload in the array
+                    // (they contain selective disclosure values like checkout_jwt)
+                    delegateDisclosures = if (i == 0) allDisclosures else emptyList(),
+                    credentialIds = credIds
+                )
+            }
         }
 
     }
