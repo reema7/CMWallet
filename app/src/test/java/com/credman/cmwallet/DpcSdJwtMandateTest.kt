@@ -253,7 +253,10 @@ class DpcSdJwtMandateTest {
     }
 
     @Test
-    fun `sd_hash in KB-SD-JWT_1 covers dpc_jwt and dpc_discs only`() {
+    fun `sd_hash in each KB-SD-JWT covers only DPC base — parallel design`() {
+        // Parallel design: both KB-SD-JWTs root independently in the DPC.
+        // sd_hash = SHA-256(dpc_jwt ~ dpc_discs ~ [mandate_own_discs] ~)
+        // KB-SD-JWT_payment does NOT include KB-SD-JWT_checkout in its sd_hash.
         val proposals = listOf(
             DelegateProposal("e1", "dc+sd-jwt", checkoutPayload(), emptyList(), listOf(DPC_CRED_ID)),
             DelegateProposal("e2", "dc+sd-jwt", paymentPayload(),  emptyList(), listOf(DPC_CRED_ID))
@@ -261,29 +264,26 @@ class DpcSdJwtMandateTest {
         val chain = SdJwt(dpcCredential, holderKeyNormalized).presentWithDelegations(
             null, TEST_NONCE, TEST_AUD, emptyMap(), proposals
         )
-        val parts = chain.split("~").dropLast(1) // drop trailing empty
-
-        // The two KB-SD-JWTs are compact JWTs at positions > 0
+        val parts = chain.split("~").dropLast(1)
         val kbPositions = parts.indices.filter { it > 0 && parts[it].split(".").size == 3 }
         assertEquals(2, kbPositions.size)
 
-        // KB-SD-JWT_1 sd_hash = SHA256( parts[0..kbPos1-1].join("~") + "~" )
         val pos1 = kbPositions[0]
-        val precede1 = parts.subList(0, pos1).joinToString("~", postfix = "~")
-        val expected1 = sha256b64url(precede1)
-        val (_, p1) = decodeJwt(parts[pos1])
-        assertEquals("KB-SD-JWT_1 sd_hash is wrong", expected1, p1.getString("sd_hash"))
-
-        // KB-SD-JWT_2 sd_hash = SHA256( parts[0..kbPos2-1].join("~") + "~" )
-        // — this INCLUDES KB-SD-JWT_1, extending the chain commitment
         val pos2 = kbPositions[1]
-        val precede2 = parts.subList(0, pos2).joinToString("~", postfix = "~")
-        val expected2 = sha256b64url(precede2)
-        val (_, p2) = decodeJwt(parts[pos2])
-        assertEquals("KB-SD-JWT_2 sd_hash is wrong (must chain from KB-SD-JWT_1)", expected2, p2.getString("sd_hash"))
 
-        // Verify the two sd_hashes are different (KB-SD-JWT_2 commits to more content)
-        assertNotEquals("Both sd_hashes cannot be equal", p1.getString("sd_hash"), p2.getString("sd_hash"))
+        // DPC base parts = everything before the first KB-SD-JWT (issuer_jwt + dpc_discs)
+        val dpcBase = parts.subList(0, pos1).joinToString("~", postfix = "~")
+        val expectedDpcHash = sha256b64url(dpcBase)
+
+        val (_, p1) = decodeJwt(parts[pos1])
+        val (_, p2) = decodeJwt(parts[pos2])
+
+        // Both mandates have the same sd_hash base (DPC only, no delegate discs in either)
+        assertEquals("KB-SD-JWT_checkout sd_hash must cover DPC base only", expectedDpcHash, p1.getString("sd_hash"))
+        assertEquals("KB-SD-JWT_payment sd_hash must cover DPC base only", expectedDpcHash, p2.getString("sd_hash"))
+
+        // They are equal because neither proposal has delegate_disclosures
+        assertEquals("Both sd_hashes equal in this case (no delegate discs)", p1.getString("sd_hash"), p2.getString("sd_hash"))
     }
 
     @Test
@@ -468,7 +468,9 @@ class DpcSdJwtMandateTest {
     }
 
     @Test
-    fun `payment mandate presentation to payment network carries full consent chain`() {
+    fun `payment mandate presentation to payment network uses DPC prefix only — no checkout KB-SD-JWT`() {
+        // Parallel design: payment network only gets DPC + KB-SD-JWT_payment.
+        // They never see the checkout mandate or checkout_jwt disclosure.
         val proposals = listOf(
             DelegateProposal("e1", "dc+sd-jwt", checkoutPayload(), emptyList(), listOf(DPC_CRED_ID)),
             DelegateProposal("e2", "dc+sd-jwt", paymentPayload(),  emptyList(), listOf(DPC_CRED_ID))
@@ -477,39 +479,47 @@ class DpcSdJwtMandateTest {
             null, TEST_NONCE, TEST_AUD, emptyMap(), proposals
         )
         val parts = chain.split("~").dropLast(1)
+        val kbPositions = parts.indices.filter { it > 0 && parts[it].split(".").size == 3 }
+        assertEquals(2, kbPositions.size)
 
-        // Full chain prefix = everything the wallet produced (both KB-SD-JWTs)
-        val fullPrefix = parts.joinToString("~", postfix = "~")
+        val pos1 = kbPositions[0]  // KB-SD-JWT_checkout position
+        val pos2 = kbPositions[1]  // KB-SD-JWT_payment position
+
+        // Agent builds payment-only prefix: dpc_jwt ~ dpc_discs ~ KB-SD-JWT_payment ~
+        // Skip checkout disc and KB-SD-JWT_checkout — payment network should not see them
+        val dpcParts = parts.subList(0, pos1)  // issuer_jwt + dpc_discs (before checkout KB-SD-JWT)
+        val paymentKbSdJwt = parts[pos2]
+        val paymentPrefix = (dpcParts + listOf(paymentKbSdJwt)).joinToString("~", postfix = "~")
 
         val paymentNonce = "payment-network-nonce-abc"
         val paymentAud   = "origin:https://paymentnetwork.example"
-        val presentedToNetwork = agentAddKbJwt(fullPrefix, paymentNonce, paymentAud)
+        val presentedToNetwork = agentAddKbJwt(paymentPrefix, paymentNonce, paymentAud)
 
         assertFalse("Must not end with ~", presentedToNetwork.endsWith("~"))
         val pParts = presentedToNetwork.split("~").filter { it.isNotEmpty() }
 
+        // Agent KB-JWT sd_hash covers only dpc_base + KB-SD-JWT_payment
         val (_, agentKbPayload) = decodeJwt(pParts.last())
-        val expectedSdHash = sha256b64url(fullPrefix)
-        assertEquals("sd_hash must cover full chain including checkout KB-SD-JWT", expectedSdHash, agentKbPayload.getString("sd_hash"))
+        val expectedSdHash = sha256b64url(paymentPrefix)
+        assertEquals("sd_hash must cover payment prefix only", expectedSdHash, agentKbPayload.getString("sd_hash"))
         assertEquals(paymentNonce, agentKbPayload.getString("nonce"))
         assertEquals(paymentAud,   agentKbPayload.getString("aud"))
 
-        // Both KB-SD-JWTs are present
+        // Only one KB-SD-JWT in the presented chain (payment only, no checkout)
         val kbSdJwts = pParts.drop(1).dropLast(1).filter { it.split(".").size == 3 }
-        assertEquals("Full chain must carry both KB-SD-JWTs", 2, kbSdJwts.size)
-        val vcts = kbSdJwts.map { decodeJwt(it).second.getString("vct") }
-        assertTrue(vcts.contains("mandate.checkout.1"))
-        assertTrue(vcts.contains("mandate.payment"))
+        assertEquals("Payment-only chain must carry only the payment KB-SD-JWT", 1, kbSdJwts.size)
+        assertEquals("mandate.payment", decodeJwt(kbSdJwts[0]).second.getString("vct"))
 
-        println("✓ Full chain presentation to payment network:")
-        println("  Chain parts: ${pParts.size}  (issuer_jwt + dpc_discs + KB-SD-JWT_checkout + KB-SD-JWT_payment + agent_kb_jwt)")
+        println("✓ Payment-only presentation to credential provider:")
+        println("  Chain parts: ${pParts.size}  (issuer_jwt + dpc_discs + KB-SD-JWT_payment + agent_kb_jwt)")
+        println("  Checkout KB-SD-JWT NOT included — payment network never sees cart details")
     }
 
     @Test
-    fun `payment mandate sd_hash proves it was signed over DPC and checkout mandate together`() {
-        // This test verifies the KEY incremental security property:
-        // KB-SD-JWT_payment's sd_hash commits to the checkout mandate being present.
-        // An attacker cannot strip KB-SD-JWT_checkout and still have a valid payment mandate.
+    fun `payment mandate sd_hash covers only DPC base — parallel design`() {
+        // Parallel design: KB-SD-JWT_payment.sd_hash = SHA-256(dpc_jwt~dpc_discs~)
+        // It does NOT include KB-SD-JWT_checkout.
+        // Cross-mandate binding is via constraints.payment.reference.checkout_reference (application layer).
         val proposals = listOf(
             DelegateProposal("e1", "dc+sd-jwt", checkoutPayload("specific-checkout-hash"), emptyList(), listOf(DPC_CRED_ID)),
             DelegateProposal("e2", "dc+sd-jwt", paymentPayload(), emptyList(), listOf(DPC_CRED_ID))
@@ -527,27 +537,28 @@ class DpcSdJwtMandateTest {
         val (_, p2) = decodeJwt(parts[pos2])
         val actualSdHash2 = p2.getString("sd_hash")
 
-        // sd_hash in payment mandate = SHA256(dpc_jwt~dpc_discs~KB-SD-JWT_checkout~)
-        // i.e. it includes KB-SD-JWT_checkout — proving the two mandates are linked
-        val chainWithCheckout = parts.subList(0, pos2).joinToString("~", postfix = "~")
-        val expectedSdHash2 = sha256b64url(chainWithCheckout)
-        assertEquals(expectedSdHash2, actualSdHash2)
+        // sd_hash in payment mandate = SHA-256(dpc_jwt~dpc_discs~) only
+        // dpc_discs are parts[1..pos1-1] (everything before checkout KB-SD-JWT and its discs)
+        val dpcOnlyParts = parts.subList(0, pos1)  // issuer_jwt + dpc_discs (no checkout content)
+        val expectedSdHash2 = sha256b64url(dpcOnlyParts.joinToString("~", postfix = "~"))
+        assertEquals("Payment sd_hash must cover DPC base only", expectedSdHash2, actualSdHash2)
 
-        // Confirm it's DIFFERENT from sd_hash that would result from stripping KB-SD-JWT_checkout
-        val chainWithoutCheckout = (parts.subList(0, pos1) + parts.subList(pos1 + 1, pos2))
-            .joinToString("~", postfix = "~")
-        val strippedSdHash = sha256b64url(chainWithoutCheckout)
-        assertNotEquals(
-            "Payment mandate sd_hash must change if checkout mandate is stripped — cannot be used independently",
-            strippedSdHash, actualSdHash2
+        // Confirm payment sd_hash == checkout sd_hash (both cover same DPC base, no discs)
+        val (_, p1) = decodeJwt(parts[pos1])
+        assertEquals(
+            "Both mandates have same sd_hash base (parallel roots)",
+            p1.getString("sd_hash"), p2.getString("sd_hash")
         )
 
-        println("✓ Payment mandate is cryptographically bound to checkout mandate via sd_hash")
-        println("  Checkout KB-SD-JWT is part of the commitment — cannot be stripped")
+        println("✓ Payment mandate sd_hash covers DPC only (parallel design)")
+        println("  Cross-mandate binding is via checkout_reference field in payment constraints")
     }
 
     @Test
-    fun `incremental chains have different sd_hash commitments`() {
+    fun `both mandates have same sd_hash base in parallel design`() {
+        // In the parallel design, both KB-SD-JWTs root in the same DPC base.
+        // If no delegate_disclosures differ, sd_hash for both mandates is identical.
+        // Each mandate is independently verifiable against the DPC.
         val proposals = listOf(
             DelegateProposal("e1", "dc+sd-jwt", checkoutPayload(), emptyList(), listOf(DPC_CRED_ID)),
             DelegateProposal("e2", "dc+sd-jwt", paymentPayload(),  emptyList(), listOf(DPC_CRED_ID))
@@ -557,22 +568,40 @@ class DpcSdJwtMandateTest {
         )
         val parts = chain.split("~").dropLast(1)
         val kbPositions = parts.indices.filter { it > 0 && parts[it].split(".").size == 3 }
+        assertEquals(2, kbPositions.size)
 
         val (_, kb1Payload) = decodeJwt(parts[kbPositions[0]])
         val (_, kb2Payload) = decodeJwt(parts[kbPositions[1]])
 
-        // sd_hash1 covers DPC only; sd_hash2 covers DPC + checkout mandate
-        // They must be different — each mandate commits to a strictly larger set of content
-        assertNotEquals(
-            "Incremental KB-SD-JWTs must have different sd_hash values",
+        // Both sd_hashes cover same DPC base (no delegate_disclosures in either proposal here)
+        assertEquals(
+            "Both parallel mandates root in same DPC base → same sd_hash when no delegate discs differ",
             kb1Payload.getString("sd_hash"),
             kb2Payload.getString("sd_hash")
         )
 
-        // sd_hash2 implicitly contains sd_hash1's content (subset relationship)
-        val prefix1 = parts.subList(0, kbPositions[0]).joinToString("~", postfix = "~")
-        val prefix2 = parts.subList(0, kbPositions[1]).joinToString("~", postfix = "~")
-        assertTrue("Prefix 2 must contain prefix 1 as a substring", prefix2.startsWith(prefix1))
+        // With delegate_disclosures, sd_hashes differ (checkout mandate opens checkout_jwt box)
+        val checkoutDisc = "WyJzYWx0IiwiY2hlY2tvdXRfand0IiwiPGp3dD4iXQ"  // fake disclosure
+        val proposalsWithDisc = listOf(
+            DelegateProposal("e1", "dc+sd-jwt", checkoutPayload(), listOf(checkoutDisc), listOf(DPC_CRED_ID)),
+            DelegateProposal("e2", "dc+sd-jwt", paymentPayload(),  emptyList(), listOf(DPC_CRED_ID))
+        )
+        val chain2 = SdJwt(dpcCredential, holderKeyNormalized).presentWithDelegations(
+            null, TEST_NONCE, TEST_AUD, emptyMap(), proposalsWithDisc
+        )
+        val parts2 = chain2.split("~").dropLast(1)
+        val kbPos2 = parts2.indices.filter { it > 0 && parts2[it].split(".").size == 3 }
+        val (_, kb1WithDisc) = decodeJwt(parts2[kbPos2[0]])
+        val (_, kb2WithDisc) = decodeJwt(parts2[kbPos2[1]])
+
+        assertNotEquals(
+            "When checkout mandate has delegate_disclosures, its sd_hash differs from payment mandate",
+            kb1WithDisc.getString("sd_hash"),
+            kb2WithDisc.getString("sd_hash")
+        )
+
+        println("✓ Parallel design: mandates share DPC base sd_hash when no delegate discs differ")
+        println("  Adding checkout_disc to checkout mandate changes only that mandate's sd_hash")
     }
 
 

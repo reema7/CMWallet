@@ -165,26 +165,29 @@ class SdJwt(
     /**
      * Produces a dSD-JWT chain for the HITL AP2 mandate flow.
      *
-     * The DPC SD-JWT is presented normally (no KB-JWT from the wallet). Instead, for each
-     * [DelegateProposal] the wallet produces a **KB-SD-JWT**: a compact JWT that simultaneously
-     * serves as the KB-JWT for the preceding SD-JWT in the chain AND carries the mandate payload
-     * (vct, cnf.jwk=agent_key, constraints / checkout_hash, etc.) as its own JWT claims.
+     * **Parallel design** — every KB-SD-JWT's `sd_hash` covers only the DPC base
+     * (issuer_jwt + DPC disclosures + this mandate's own delegate_disclosures), NOT any other
+     * KB-SD-JWT. This means each mandate is independently presentable to its verifier:
+     *  - Checkout mandate → agent presents to merchant (with checkout_disc opened)
+     *  - Payment mandate  → agent presents to credential provider (no checkout_disc, no checkout KB-SD-JWT)
+     *
+     * Cross-mandate binding is provided by `payment.reference.checkout_reference` in the payment
+     * mandate's constraints (= SHA-256(checkout_jwt)), verified at the application layer.
      *
      * Chain structure (all parts joined with `~`):
      * ```
-     *   dpc_issuer_jwt ~ dpc_disc1 ~ ... ~ checkout_discs ~ KB-SD-JWT_checkout
-     *                              ~ payment_discs ~ KB-SD-JWT_payment ~
+     *   dpc_issuer_jwt ~ dpc_disc1 ~ ... ~ checkout_disc ~ KB-SD-JWT_checkout
+     *                                                     ~ KB-SD-JWT_payment ~
      * ```
-     * - Every KB-SD-JWT is signed with the holder's **device key** (cnf key of the preceding SD-JWT).
-     * - `sd_hash` in each KB-SD-JWT covers everything that preceded it (base SD-JWT + earlier parts).
-     * - `cnf.jwk` in each KB-SD-JWT's delegate payload = agent's public key (delegatee).
-     * - Trailing `~` signals no agent KB-JWT yet; the agent appends that when presenting to a verifier.
+     * KB-SD-JWT_payment.sd_hash = SHA-256(dpc_jwt~dpc_discs~) only — does NOT cover KB-SD-JWT_checkout.
      *
-     * Verification (per spec):
-     *  1. Verify DPC SD-JWT using issuer key; KB = KB-SD-JWT_checkout.
-     *  2. For each KB-SD-JWT: verify as SD-JWT+KB using delegate payload as JWT payload and the cnf
-     *     key from the preceding SD-JWT. Next KB-SD-JWT (or agent's KB-JWT) is the KB.
-     *  3. Final KB-SD-JWT includes transaction binding data (nonce, aud, transaction_data_hashes).
+     * Agent presentations:
+     *  - → Merchant:            dpc_jwt~dpc_discs~checkout_disc~KB-SD-JWT_checkout~ + agent KB-JWT
+     *  - → Credential provider: dpc_jwt~dpc_discs~KB-SD-JWT_payment~ + agent KB-JWT
+     *    (payment network never receives checkout_disc or KB-SD-JWT_checkout)
+     *
+     * Every KB-SD-JWT is signed with the holder's device key (cnf of the DPC).
+     * Trailing `~` signals no agent KB-JWT yet; agent appends it when presenting to a verifier.
      */
     @OptIn(ExperimentalSerializationApi::class)
     fun presentWithDelegations(
@@ -250,13 +253,15 @@ class SdJwt(
             // Append the delegate's own selective disclosures (for claims like checkout_jwt)
             parts.addAll(proposal.delegateDisclosures)
 
-            // sd_hash covers the entire preceding chain: parts.joinToString("~") + "~"
-            val precedingChain = parts.joinToString("~", postfix = "~")
+            // sd_hash covers ONLY: dpc_base + this mandate's own delegate_disclosures
+            // Parallel design: does NOT include previous KB-SD-JWTs
+            val precedingParts = listOf(issuerJwt) + selectedDisclosures + proposal.delegateDisclosures
+            val precedingChain = precedingParts.joinToString("~", postfix = "~")
             val sdHash = MessageDigest.getInstance("SHA-256")
                 .digest(precedingChain.encodeToByteArray())
                 .toBase64UrlNoPadding()
 
-            // Build KB-SD-JWT header: typ="kb+jwt" (it IS a KB-JWT for the preceding SD-JWT)
+            // Build KB-SD-JWT header: typ="kb+jwt" (it IS a KB-JWT for the DPC SD-JWT)
             val kbSdHeader = buildJsonObject {
                 put("typ", "kb+jwt")
                 put("alg", "ES256")

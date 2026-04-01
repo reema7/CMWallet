@@ -153,7 +153,9 @@ class Ap2SampleGenerator {
         }
 
         // ── Wallet processes the request ───────────────────────────────────────
-        val holderKeyNorm = holderPrivKeyB64Url.replace("+","-").replace("/","_")
+        val holderPrivKeyB64Url2 = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgD17D2RSlvQ8ElFrPqEG3JfXTjxyKEH9DMpFnWp_Z63ihRANCAATyMFauK4kFj767__aM4l9xfgmPiQSpjgJRf1x_VtB11nLB9pDhoZXpoUUbj1GBSiWGYFahF0IdiX6LUShkTHyx"
+        val dpcCred2 = DpcSdJwtMandateTest.DPC_SDJWT_CREDENTIAL
+        val holderKeyNorm = holderPrivKeyB64Url2.replace("+","-").replace("/","_")
             .replace("=","").replace("\n","").replace(" ","")
 
         val proposals = listOf(
@@ -162,7 +164,7 @@ class Ap2SampleGenerator {
             DelegateProposal("e2","dc+sd-jwt", paymentDelegatePayload,
                 emptyList(), listOf("dpc_credential"))
         )
-        val dpcSdJwt  = SdJwt(dpcCredential, holderKeyNorm)
+        val dpcSdJwt  = SdJwt(dpcCred2, holderKeyNorm)
         val vpChain   = dpcSdJwt.presentWithDelegations(
             claimSets             = null,
             nonce                 = nonce,
@@ -434,3 +436,129 @@ class Ap2SampleGenerator {
         println("\n$sep\n")
     }
 }
+
+    @Test
+    fun `output raw request and response JSON`() {
+        val kpg = KeyPairGenerator.getInstance("EC")
+        kpg.initialize(ECGenParameterSpec("secp256r1"))
+        val agentKp  = kpg.generateKeyPair()
+        val agentPub = agentKp.public as ECPublicKey
+        fun coord(raw: ByteArray): String {
+            val fixed = if (raw.size > 32) raw.copyOfRange(raw.size - 32, raw.size)
+                        else raw.copyOf(32).also { raw.copyInto(it, 32 - raw.size) }
+            return JBase64.getUrlEncoder().withoutPadding().encodeToString(fixed)
+        }
+        val agentJwk = JSONObject().apply {
+            put("kty","EC"); put("crv","P-256"); put("use","sig")
+            put("x", coord(agentPub.w.affineX.toByteArray()))
+            put("y", coord(agentPub.w.affineY.toByteArray()))
+        }
+
+        val checkoutJwtPayload = JSONObject().apply {
+            put("id","order_20260331_9f3a"); put("status","pending_payment"); put("currency","USD")
+            put("merchant", JSONObject().apply { put("id","m_lyft_001"); put("name","Lyft") })
+            put("line_items", JSONArray().put(JSONObject().apply {
+                put("title","Ride to SFO"); put("quantity",1); put("unit_price","42.50")
+            }))
+            put("totals", JSONObject().apply { put("subtotal","42.50"); put("tax","3.72"); put("total","46.22") })
+        }
+        val checkoutJwt = "eyJhbGciOiJFUzI1NiIsInR5cCI6ImNoZWNrb3V0K2p3dCJ9." +
+            JBase64.getUrlEncoder().withoutPadding().encodeToString(checkoutJwtPayload.toString().toByteArray()) +
+            ".MERCHANT_SIG"
+        val checkoutHash = JBase64.getUrlEncoder().withoutPadding()
+            .encodeToString(MessageDigest.getInstance("SHA-256").digest(checkoutJwt.toByteArray()))
+
+        val checkoutDiscArr = JSONArray().put("8eONq8oSDj4kQ7R2aF5Lnw").put("checkout_jwt").put(checkoutJwt)
+        val checkoutDisc = JBase64.getUrlEncoder().withoutPadding()
+            .encodeToString(checkoutDiscArr.toString().toByteArray())
+        val checkoutDiscDigest = JBase64.getUrlEncoder().withoutPadding()
+            .encodeToString(MessageDigest.getInstance("SHA-256").digest(checkoutDisc.toByteArray()))
+
+        val checkoutPayload = JSONObject().apply {
+            put("vct","mandate.checkout.1"); put("exp",9_999_999_999L)
+            put("cnf", JSONObject().put("jwk", agentJwk))
+            put("checkout_hash", checkoutHash)
+            put("_sd", JSONArray().put(checkoutDiscDigest)); put("_sd_alg","sha-256")
+        }
+        val paymentPayload = JSONObject().apply {
+            put("vct","mandate.payment"); put("exp",9_999_999_999L)
+            put("cnf", JSONObject().put("jwk", agentJwk))
+            put("constraints", JSONArray().apply {
+                put(JSONObject().apply { put("type","payment.amount"); put("currency","USD"); put("max","46.22") })
+                put(JSONObject().apply { put("type","payment.allowed_payees"); put("allowed", JSONArray().put("lyft.com")) })
+                put(JSONObject().apply { put("type","payment.reference"); put("checkout_reference", checkoutHash) })
+            })
+        }
+
+        fun encodeTd(p: JSONObject, discs: List<String> = emptyList()) =
+            JBase64.getUrlEncoder().withoutPadding().encodeToString(
+                JSONObject().apply {
+                    put("type","delegate"); put("format","dc+sd-jwt")
+                    put("credential_ids", JSONArray().put("dpc_credential"))
+                    put("delegate_payload", JSONArray().put(p))
+                    put("delegate_disclosures", JSONArray().apply { discs.forEach { put(it) } })
+                }.toString().toByteArray()
+            )
+
+        val nonce = "s6FhdRcsNDIIm_4YmFDd1A"
+        val clientId = "origin:https://agent.ap2.example"
+        val td0 = encodeTd(checkoutPayload, listOf(checkoutDisc))
+        val td1 = encodeTd(paymentPayload)
+
+        val request = JSONObject().apply {
+            put("nonce", nonce); put("client_id", clientId)
+            put("response_type","vp_token"); put("response_mode","dc_api")
+            put("dcql_query", JSONObject().apply {
+                put("credentials", JSONArray().put(JSONObject().apply {
+                    put("id","dpc_credential"); put("format","dc+sd-jwt")
+                    put("meta", JSONObject().put("vct_values", JSONArray().put("com.emvco.dpc")))
+                    put("claims", JSONArray().apply {
+                        put(JSONObject().put("path", JSONArray().put("card_last_four")))
+                        put(JSONObject().put("path", JSONArray().put("card_network_code")))
+                        put(JSONObject().put("path", JSONArray().put("credential_id")))
+                    })
+                }))
+            })
+            put("transaction_data", JSONArray().put(td0).put(td1))
+        }
+
+        val holderPrivKeyB64Url2 = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgD17D2RSlvQ8ElFrPqEG3JfXTjxyKEH9DMpFnWp_Z63ihRANCAATyMFauK4kFj767__aM4l9xfgmPiQSpjgJRf1x_VtB11nLB9pDhoZXpoUUbj1GBSiWGYFahF0IdiX6LUShkTHyx"
+        val dpcCred2 = DpcSdJwtMandateTest.DPC_SDJWT_CREDENTIAL
+        val holderKeyNorm = holderPrivKeyB64Url2.replace("+","-").replace("/","_")
+            .replace("=","").replace("\n","").replace(" ","")
+        val proposals = listOf(
+            DelegateProposal("e1","dc+sd-jwt",checkoutPayload,listOf(checkoutDisc),listOf("dpc_credential")),
+            DelegateProposal("e2","dc+sd-jwt",paymentPayload,emptyList(),listOf("dpc_credential"))
+        )
+        val chain = SdJwt(dpcCred2, holderKeyNorm).presentWithDelegations(
+            null, nonce, clientId, emptyMap(), proposals
+        )
+
+        // sd_hashes for agent KB-JWTs
+        val parts = chain.split("~").dropLast(1)
+        val isCompact = { s: String -> s.split(".").size == 3 }
+        val kbPositions = parts.indices.filter { it > 0 && isCompact(parts[it]) }
+        val checkoutPrefix = parts.subList(0, kbPositions[0]+1).joinToString("~", postfix="~")
+        val fullPrefix = parts.joinToString("~", postfix="~")
+        val sdHashCheckout = JBase64.getUrlEncoder().withoutPadding()
+            .encodeToString(MessageDigest.getInstance("SHA-256").digest(checkoutPrefix.toByteArray()))
+        val sdHashFull = JBase64.getUrlEncoder().withoutPadding()
+            .encodeToString(MessageDigest.getInstance("SHA-256").digest(fullPrefix.toByteArray()))
+
+        println("RAW_REQUEST_START")
+        println(request.toString(2))
+        println("RAW_REQUEST_END")
+        println("RAW_RESPONSE_START")
+        println("""{"vp_token":{"dpc_credential":"${chain.take(200)}..."}}""")
+        println("RAW_CHAIN_PARTS_START")
+        parts.forEachIndexed { i, p -> println("PART[$i]: ${p.take(80)}") }
+        println("RAW_CHAIN_PARTS_END")
+        println("SD_HASH_CHECKOUT: $sdHashCheckout")
+        println("SD_HASH_FULL: $sdHashFull")
+        println("CHECKOUT_HASH: $checkoutHash")
+        println("CHECKOUT_DISC: $checkoutDisc")
+        println("AGENT_JWK_X: ${agentJwk.getString("x")}")
+        println("AGENT_JWK_Y: ${agentJwk.getString("y")}")
+        println("CHECKOUT_JWT: $checkoutJwt")
+        println("RAW_RESPONSE_END")
+    }
