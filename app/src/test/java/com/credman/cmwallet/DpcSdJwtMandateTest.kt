@@ -175,6 +175,31 @@ class DpcSdJwtMandateTest {
     }
 
     @Test
+    fun `delegate_disclosures are matched to payload by digest not position`() {
+        // Build a real disclosure and put its digest in the checkout payload _sd
+        val disclosureArr = JSONArray().put("test-salt").put("checkout_jwt").put("eyJpZCI6InRlc3QifQ")
+        val disclosureB64 = JBase64.getUrlEncoder().withoutPadding()
+            .encodeToString(disclosureArr.toString().toByteArray())
+        val discDigest = JBase64.getUrlEncoder().withoutPadding()
+            .encodeToString(MessageDigest.getInstance("SHA-256").digest(disclosureB64.toByteArray()))
+
+        // Checkout payload references the digest in _sd; payment payload does not
+        val checkout = checkoutPayload().apply { put("_sd", JSONArray().put(discDigest)) }
+        val payment  = paymentPayload()  // no _sd
+
+        // Single transaction_data item with both payloads and the disclosure
+        val item = encodeDelegateItem(listOf(checkout, payment), listOf(disclosureB64))
+        val oid4vp = OpenId4VP(oid4vpRequest(listOf(item)), TEST_AUD, "openid4vp-v1-qrcode")
+
+        assertEquals(2, oid4vp.delegateProposals.size)
+        // Checkout proposal gets the disclosure (digest matched)
+        assertEquals(1, oid4vp.delegateProposals[0].delegateDisclosures.size)
+        assertEquals(disclosureB64, oid4vp.delegateProposals[0].delegateDisclosures[0])
+        // Payment proposal gets nothing (no matching digest)
+        assertEquals(0, oid4vp.delegateProposals[1].delegateDisclosures.size)
+    }
+
+    @Test
     fun `no delegate proposals means empty list`() {
         val oid4vp = OpenId4VP(oid4vpRequest(), TEST_AUD, "openid4vp-v1-qrcode")
         assertTrue(oid4vp.delegateProposals.isEmpty())
