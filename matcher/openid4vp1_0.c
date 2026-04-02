@@ -340,21 +340,24 @@ int main()
                             additional_info = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "additional_info"));
                     } else if (strcmp(transaction_data_type, "delegate") == 0) {
                         // AP2 dSD-JWT mandate proposal.
-                        // delegate_payload[] is an array of mandate objects:
+                        // delegate_payload[] contains mandate objects:
                         //   mandate.checkout.1: { vct, checkout_hash, checkout_jwt, exp, cnf }
+                        //     checkout_jwt payload (UCP): { id, currency, merchant:{name},
+                        //                                   line_items:[{title,quantity,unit_price}],
+                        //                                   totals:{total,...} }
                         //   mandate.payment.1:  { vct, transaction_id, payee:{id,name},
                         //                         amount:{value,currency}, payment_instrument, exp, cnf }
                         //
-                        // Parse both mandates, populate merchant_name / transaction_amount,
-                        // then build additional_info as the structured JSON the picker UI expects:
+                        // Build additional_info as the structured JSON the picker UI expects:
                         //   { "tableHeader": [...], "tableRows": [[...], ...], "footer": "..." }
+                        // tableHeader: ["Item", "Qty", "Price"]
+                        // tableRows: one row per line_item from checkout_jwt
+                        // footer: "Total: <currency> <total>" from checkout_jwt totals
                         cJSON *delegate_payload_arr = cJSON_GetObjectItem(td_item, "delegate_payload");
-                        char *checkout_hash_val   = NULL;
                         char *payee_name_val      = NULL;
                         char *amt_value_val       = NULL;
                         char *amt_currency_val    = NULL;
-                        char *instrument_type_val = NULL;
-                        char *transaction_id_val  = NULL;
+                        cJSON *checkout_jwt_payload = NULL;   // decoded JWT body for line items
 
                         if (delegate_payload_arr != NULL) {
                             int dp_count = cJSON_GetArraySize(delegate_payload_arr);
@@ -364,11 +367,11 @@ int main()
                                 if (vct == NULL) continue;
 
                                 if (strcmp(vct, "mandate.payment.1") == 0) {
-                                    // payee.name
+                                    // payee.name → merchant_name
                                     cJSON *payee = cJSON_GetObjectItem(dp, "payee");
                                     if (payee != NULL && payee_name_val == NULL)
                                         payee_name_val = cJSON_GetStringValue(cJSON_GetObjectItem(payee, "name"));
-                                    // amount.value + amount.currency
+                                    // amount.{value,currency} → transaction_amount
                                     cJSON *amount_obj = cJSON_GetObjectItem(dp, "amount");
                                     if (amount_obj != NULL) {
                                         if (amt_value_val == NULL)
@@ -376,23 +379,38 @@ int main()
                                         if (amt_currency_val == NULL)
                                             amt_currency_val = cJSON_GetStringValue(cJSON_GetObjectItem(amount_obj, "currency"));
                                     }
-                                    // payment_instrument.type
-                                    cJSON *instrument = cJSON_GetObjectItem(dp, "payment_instrument");
-                                    if (instrument != NULL && instrument_type_val == NULL)
-                                        instrument_type_val = cJSON_GetStringValue(cJSON_GetObjectItem(instrument, "type"));
-                                    // transaction_id
-                                    if (transaction_id_val == NULL)
-                                        transaction_id_val = cJSON_GetStringValue(cJSON_GetObjectItem(dp, "transaction_id"));
 
-                                } else if (strcmp(vct, "mandate.checkout.1") == 0) {
-                                    if (checkout_hash_val == NULL)
-                                        checkout_hash_val = cJSON_GetStringValue(cJSON_GetObjectItem(dp, "checkout_hash"));
+                                } else if (strcmp(vct, "mandate.checkout.1") == 0 && checkout_jwt_payload == NULL) {
+                                    // Decode checkout_jwt to extract cart line items.
+                                    // checkout_jwt is a compact JWT: header.payload.sig
+                                    // We base64url-decode the payload (middle part).
+                                    char *checkout_jwt_str = cJSON_GetStringValue(cJSON_GetObjectItem(dp, "checkout_jwt"));
+                                    if (checkout_jwt_str != NULL) {
+                                        // Find second '.' (start of payload part)
+                                        char *dot1 = strchr(checkout_jwt_str, '.');
+                                        if (dot1 != NULL) {
+                                            char *payload_start = dot1 + 1;
+                                            char *dot2 = strchr(payload_start, '.');
+                                            int payload_len = dot2 ? (int)(dot2 - payload_start) : (int)strlen(payload_start);
+                                            // Copy payload segment to a NUL-terminated buffer
+                                            char *payload_b64 = malloc(payload_len + 1);
+                                            memcpy(payload_b64, payload_start, payload_len);
+                                            payload_b64[payload_len] = '\0';
+                                            // base64url-decode it
+                                            char *decoded_json = NULL;
+                                            int decoded_len = B64DecodeURL(payload_b64, &decoded_json);
+                                            free(payload_b64);
+                                            if (decoded_len > 0 && decoded_json != NULL) {
+                                                checkout_jwt_payload = cJSON_Parse(decoded_json);
+                                                free(decoded_json);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
 
-                        // Populate merchant_name and transaction_amount for the entry title/subtitle
-                        // (these are the fields used by the card picker header)
+                        // Populate merchant_name and transaction_amount for card picker header
                         if (merchant_name == NULL && payee_name_val != NULL)
                             merchant_name = payee_name_val;
                         if (transaction_amount == NULL && amt_value_val != NULL && amt_currency_val != NULL) {
@@ -400,55 +418,59 @@ int main()
                             sprintf(transaction_amount, "%s %s", amt_currency_val, amt_value_val);
                         }
 
-                        // Build additional_info as the structured JSON the picker UI renders:
-                        //   tableHeader: ["Detail", "Value"]
-                        //   tableRows: [["Payee", <name>], ["Amount", "<cur> <val>"],
-                        //               ["Instrument", <type>]]
-                        //   footer: "Transaction: <txn_id_prefix>..."
+                        // Build additional_info JSON for picker UI
                         if (additional_info == NULL) {
                             cJSON *ai_obj = cJSON_CreateObject();
 
-                            // tableHeader
+                            // tableHeader: ["Item", "Qty", "Price"]
                             cJSON *header_arr = cJSON_CreateArray();
-                            cJSON_AddItemToArray(header_arr, cJSON_CreateString("Detail"));
-                            cJSON_AddItemToArray(header_arr, cJSON_CreateString("Value"));
+                            cJSON_AddItemToArray(header_arr, cJSON_CreateString("Item"));
+                            cJSON_AddItemToArray(header_arr, cJSON_CreateString("Qty"));
+                            cJSON_AddItemToArray(header_arr, cJSON_CreateString("Price"));
                             cJSON_AddItemToObject(ai_obj, "tableHeader", header_arr);
 
-                            // tableRows
+                            // tableRows: one row per line_item in checkout_jwt
                             cJSON *rows_arr = cJSON_CreateArray();
-
-                            if (payee_name_val != NULL) {
-                                cJSON *row = cJSON_CreateArray();
-                                cJSON_AddItemToArray(row, cJSON_CreateString("Payee"));
-                                cJSON_AddItemToArray(row, cJSON_CreateString(payee_name_val));
-                                cJSON_AddItemToArray(rows_arr, row);
-                            }
-                            if (amt_value_val != NULL && amt_currency_val != NULL) {
-                                char amt_str[48] = {0};
-                                snprintf(amt_str, sizeof(amt_str), "%s %s", amt_currency_val, amt_value_val);
-                                cJSON *row = cJSON_CreateArray();
-                                cJSON_AddItemToArray(row, cJSON_CreateString("Amount"));
-                                cJSON_AddItemToArray(row, cJSON_CreateString(amt_str));
-                                cJSON_AddItemToArray(rows_arr, row);
-                            }
-                            if (instrument_type_val != NULL) {
-                                cJSON *row = cJSON_CreateArray();
-                                cJSON_AddItemToArray(row, cJSON_CreateString("Instrument"));
-                                cJSON_AddItemToArray(row, cJSON_CreateString(instrument_type_val));
-                                cJSON_AddItemToArray(rows_arr, row);
+                            if (checkout_jwt_payload != NULL) {
+                                cJSON *line_items = cJSON_GetObjectItem(checkout_jwt_payload, "line_items");
+                                if (line_items != NULL) {
+                                    int li_count = cJSON_GetArraySize(line_items);
+                                    for (int li = 0; li < li_count; li++) {
+                                        cJSON *item = cJSON_GetArrayItem(line_items, li);
+                                        char *title      = cJSON_GetStringValue(cJSON_GetObjectItem(item, "title"));
+                                        char *unit_price = cJSON_GetStringValue(cJSON_GetObjectItem(item, "unit_price"));
+                                        double qty_num   = cJSON_GetNumberValue(cJSON_GetObjectItem(item, "quantity"));
+                                        char qty_str[16] = {0};
+                                        snprintf(qty_str, sizeof(qty_str), "%.0f", qty_num);
+                                        cJSON *row = cJSON_CreateArray();
+                                        cJSON_AddItemToArray(row, cJSON_CreateString(title      ? title      : ""));
+                                        cJSON_AddItemToArray(row, cJSON_CreateString(qty_str));
+                                        cJSON_AddItemToArray(row, cJSON_CreateString(unit_price ? unit_price : ""));
+                                        cJSON_AddItemToArray(rows_arr, row);
+                                    }
+                                }
                             }
                             cJSON_AddItemToObject(ai_obj, "tableRows", rows_arr);
 
-                            // footer: truncated transaction_id (from payment mandate)
-                            // or checkout_hash (from checkout mandate) as fallback
-                            char footer_str[48] = {0};
-                            char *ref = transaction_id_val ? transaction_id_val : checkout_hash_val;
-                            if (ref != NULL)
-                                snprintf(footer_str, sizeof(footer_str), "Txn: %.16s...", ref);
+                            // footer: "Total: <currency> <total>" from checkout_jwt totals
+                            char footer_str[64] = {0};
+                            if (checkout_jwt_payload != NULL) {
+                                cJSON *totals = cJSON_GetObjectItem(checkout_jwt_payload, "totals");
+                                char *total_val  = totals ? cJSON_GetStringValue(cJSON_GetObjectItem(totals, "total")) : NULL;
+                                char *cur = cJSON_GetStringValue(cJSON_GetObjectItem(checkout_jwt_payload, "currency"));
+                                if (total_val && cur)
+                                    snprintf(footer_str, sizeof(footer_str), "Total: %s %s", cur, total_val);
+                                else if (total_val)
+                                    snprintf(footer_str, sizeof(footer_str), "Total: %s", total_val);
+                            }
                             cJSON_AddItemToObject(ai_obj, "footer", cJSON_CreateString(footer_str));
 
                             additional_info = cJSON_PrintUnformatted(ai_obj);
                             cJSON_Delete(ai_obj);
+                            if (checkout_jwt_payload != NULL) {
+                                cJSON_Delete(checkout_jwt_payload);
+                                checkout_jwt_payload = NULL;
+                            }
                         }
                     } else {
                         // Generic fallback
