@@ -340,17 +340,22 @@ int main()
                             additional_info = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "additional_info"));
                     } else if (strcmp(transaction_data_type, "delegate") == 0) {
                         // AP2 dSD-JWT mandate proposal.
-                        // delegate_payload[] is an array of mandate objects (one per mandate type).
-                        // Schemas:
+                        // delegate_payload[] is an array of mandate objects:
                         //   mandate.checkout.1: { vct, checkout_hash, checkout_jwt, exp, cnf }
                         //   mandate.payment.1:  { vct, transaction_id, payee:{id,name},
                         //                         amount:{value,currency}, payment_instrument, exp, cnf }
                         //
-                        // We iterate all items and populate merchant_name / transaction_amount from
-                        // the payment mandate, then build additional_info as a combined summary string
-                        // so that the picker UI (which reads additional_info) keeps working unchanged.
+                        // Parse both mandates, populate merchant_name / transaction_amount,
+                        // then build additional_info as the structured JSON the picker UI expects:
+                        //   { "tableHeader": [...], "tableRows": [[...], ...], "footer": "..." }
                         cJSON *delegate_payload_arr = cJSON_GetObjectItem(td_item, "delegate_payload");
-                        char *checkout_hash_val = NULL;
+                        char *checkout_hash_val   = NULL;
+                        char *payee_name_val      = NULL;
+                        char *amt_value_val       = NULL;
+                        char *amt_currency_val    = NULL;
+                        char *instrument_type_val = NULL;
+                        char *transaction_id_val  = NULL;
+
                         if (delegate_payload_arr != NULL) {
                             int dp_count = cJSON_GetArraySize(delegate_payload_arr);
                             for (int dp_i = 0; dp_i < dp_count; dp_i++) {
@@ -359,52 +364,91 @@ int main()
                                 if (vct == NULL) continue;
 
                                 if (strcmp(vct, "mandate.payment.1") == 0) {
-                                    // --- payment mandate (mandate.payment.1) ---
-                                    // payee.name → merchant_name
-                                    if (merchant_name == NULL) {
-                                        cJSON *payee = cJSON_GetObjectItem(dp, "payee");
-                                        if (payee != NULL)
-                                            merchant_name = cJSON_GetStringValue(cJSON_GetObjectItem(payee, "name"));
+                                    // payee.name
+                                    cJSON *payee = cJSON_GetObjectItem(dp, "payee");
+                                    if (payee != NULL && payee_name_val == NULL)
+                                        payee_name_val = cJSON_GetStringValue(cJSON_GetObjectItem(payee, "name"));
+                                    // amount.value + amount.currency
+                                    cJSON *amount_obj = cJSON_GetObjectItem(dp, "amount");
+                                    if (amount_obj != NULL) {
+                                        if (amt_value_val == NULL)
+                                            amt_value_val = cJSON_GetStringValue(cJSON_GetObjectItem(amount_obj, "value"));
+                                        if (amt_currency_val == NULL)
+                                            amt_currency_val = cJSON_GetStringValue(cJSON_GetObjectItem(amount_obj, "currency"));
                                     }
-                                    // amount.value + amount.currency → transaction_amount
-                                    if (transaction_amount == NULL) {
-                                        cJSON *amount_obj = cJSON_GetObjectItem(dp, "amount");
-                                        if (amount_obj != NULL) {
-                                            char *amt_val = cJSON_GetStringValue(cJSON_GetObjectItem(amount_obj, "value"));
-                                            char *amt_cur = cJSON_GetStringValue(cJSON_GetObjectItem(amount_obj, "currency"));
-                                            if (amt_val && amt_cur) {
-                                                transaction_amount = malloc(strlen(amt_val) + strlen(amt_cur) + 2);
-                                                sprintf(transaction_amount, "%s %s", amt_cur, amt_val);
-                                            }
-                                        }
-                                    }
+                                    // payment_instrument.type
+                                    cJSON *instrument = cJSON_GetObjectItem(dp, "payment_instrument");
+                                    if (instrument != NULL && instrument_type_val == NULL)
+                                        instrument_type_val = cJSON_GetStringValue(cJSON_GetObjectItem(instrument, "type"));
+                                    // transaction_id
+                                    if (transaction_id_val == NULL)
+                                        transaction_id_val = cJSON_GetStringValue(cJSON_GetObjectItem(dp, "transaction_id"));
 
                                 } else if (strcmp(vct, "mandate.checkout.1") == 0) {
-                                    // --- checkout mandate (mandate.checkout.1) ---
-                                    // checkout_hash — keep for summary
                                     if (checkout_hash_val == NULL)
                                         checkout_hash_val = cJSON_GetStringValue(cJSON_GetObjectItem(dp, "checkout_hash"));
                                 }
                             }
                         }
-                        // Build additional_info as a combined summary for the picker UI.
-                        // Format: "Mandate: <merchant> <amount> | Checkout: <hash_prefix>"
-                        // Placed into additional_info so rendering needs no changes.
+
+                        // Populate merchant_name and transaction_amount for the entry title/subtitle
+                        // (these are the fields used by the card picker header)
+                        if (merchant_name == NULL && payee_name_val != NULL)
+                            merchant_name = payee_name_val;
+                        if (transaction_amount == NULL && amt_value_val != NULL && amt_currency_val != NULL) {
+                            transaction_amount = malloc(strlen(amt_value_val) + strlen(amt_currency_val) + 2);
+                            sprintf(transaction_amount, "%s %s", amt_currency_val, amt_value_val);
+                        }
+
+                        // Build additional_info as the structured JSON the picker UI renders:
+                        //   tableHeader: ["Detail", "Value"]
+                        //   tableRows: [["Payee", <name>], ["Amount", "<cur> <val>"],
+                        //               ["Instrument", <type>]]
+                        //   footer: "Transaction: <txn_id_prefix>..."
                         if (additional_info == NULL) {
-                            char name_part[64]  = {0};
-                            char amt_part[32]   = {0};
-                            char hash_part[32]  = {0};
-                            if (merchant_name)
-                                snprintf(name_part, sizeof(name_part), "%s", merchant_name);
-                            if (transaction_amount)
-                                snprintf(amt_part, sizeof(amt_part), " %s", transaction_amount);
-                            if (checkout_hash_val)
-                                snprintf(hash_part, sizeof(hash_part), " | Chk: %.12s...", checkout_hash_val);
-                            if (name_part[0] || amt_part[0] || hash_part[0]) {
-                                int ai_len = strlen(name_part) + strlen(amt_part) + strlen(hash_part) + 16;
-                                additional_info = malloc(ai_len);
-                                snprintf(additional_info, ai_len, "Mandate:%s%s%s", name_part, amt_part, hash_part);
+                            cJSON *ai_obj = cJSON_CreateObject();
+
+                            // tableHeader
+                            cJSON *header_arr = cJSON_CreateArray();
+                            cJSON_AddItemToArray(header_arr, cJSON_CreateString("Detail"));
+                            cJSON_AddItemToArray(header_arr, cJSON_CreateString("Value"));
+                            cJSON_AddItemToObject(ai_obj, "tableHeader", header_arr);
+
+                            // tableRows
+                            cJSON *rows_arr = cJSON_CreateArray();
+
+                            if (payee_name_val != NULL) {
+                                cJSON *row = cJSON_CreateArray();
+                                cJSON_AddItemToArray(row, cJSON_CreateString("Payee"));
+                                cJSON_AddItemToArray(row, cJSON_CreateString(payee_name_val));
+                                cJSON_AddItemToArray(rows_arr, row);
                             }
+                            if (amt_value_val != NULL && amt_currency_val != NULL) {
+                                char amt_str[48] = {0};
+                                snprintf(amt_str, sizeof(amt_str), "%s %s", amt_currency_val, amt_value_val);
+                                cJSON *row = cJSON_CreateArray();
+                                cJSON_AddItemToArray(row, cJSON_CreateString("Amount"));
+                                cJSON_AddItemToArray(row, cJSON_CreateString(amt_str));
+                                cJSON_AddItemToArray(rows_arr, row);
+                            }
+                            if (instrument_type_val != NULL) {
+                                cJSON *row = cJSON_CreateArray();
+                                cJSON_AddItemToArray(row, cJSON_CreateString("Instrument"));
+                                cJSON_AddItemToArray(row, cJSON_CreateString(instrument_type_val));
+                                cJSON_AddItemToArray(rows_arr, row);
+                            }
+                            cJSON_AddItemToObject(ai_obj, "tableRows", rows_arr);
+
+                            // footer: truncated transaction_id (from payment mandate)
+                            // or checkout_hash (from checkout mandate) as fallback
+                            char footer_str[48] = {0};
+                            char *ref = transaction_id_val ? transaction_id_val : checkout_hash_val;
+                            if (ref != NULL)
+                                snprintf(footer_str, sizeof(footer_str), "Txn: %.16s...", ref);
+                            cJSON_AddItemToObject(ai_obj, "footer", cJSON_CreateString(footer_str));
+
+                            additional_info = cJSON_PrintUnformatted(ai_obj);
+                            cJSON_Delete(ai_obj);
                         }
                     } else {
                         // Generic fallback
