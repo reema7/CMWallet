@@ -92,7 +92,9 @@ class DpcSdJwtMandateTest {
         JSONObject().apply {
             put("vct", "mandate.payment.1")
             put("exp", 9_999_999_999L)
-            put("cnf", JSONObject().put("jwk", agentPubKeyJwk))
+            // No cnf — payment mandate is already bound to the transaction via
+            // transaction_id = SHA-256(checkout_jwt), which equals checkout_hash.
+            // Only the checkout mandate carries cnf.jwk for agent key binding.
             put("transaction_id", transactionId)
             put("payee", JSONObject().apply { put("id", "m_lyft_001"); put("name", "Lyft") })
             put("amount", JSONObject().apply { put("value", "46.22"); put("currency", "USD") })
@@ -393,7 +395,8 @@ class DpcSdJwtMandateTest {
         assertTrue(mandateObj.has("payee"))
         assertTrue(mandateObj.has("amount"))
         assertTrue(mandateObj.has("payment_instrument"))
-        assertTrue(mandateObj.has("cnf"))
+        // Note: no cnf in payment mandate — bound via transaction_id instead
+        assertFalse("Payment mandate must not carry cnf", mandateObj.has("cnf"))
     }
 
     @Test
