@@ -110,33 +110,20 @@ class OpenId4VP(
             transactionData = emptyList()
         }
 
-        // Each delegate transaction_data item may carry multiple payloads in delegate_payload[].
-        // We create one DelegateProposal per payload entry.
-        //
-        // delegate_disclosures are item-level but are matched to their payload by digest:
-        // SHA-256(disclosure_b64) is computed for each disclosure and checked against the
-        // _sd array of each payload — same mechanism as standard SD-JWT selective disclosure.
-        // This means the requester can include any number of disclosures for any payload
-        // and the wallet will assign them correctly without relying on ordering.
+        // Each mandate object in delegate_payload[] becomes one DelegateProposal.
+        // delegate_disclosures are item-level sub-disclosures (e.g. checkout_jwt value).
+        // Sub-disclosures are attached to the first proposal; wallet appends them after
+        // mandate disclosures in the chain. Usually empty for our flow.
         delegateProposals = transactionData.filter {
             it.type == "delegate"
         }.flatMap { td ->
             val payloadArr = td.data.optJSONArray("delegate_payload")
                 ?: return@flatMap emptyList()
             val disclosuresArr = td.data.optJSONArray("delegate_disclosures")
-            val allDisclosures = if (disclosuresArr != null)
+            val subDisclosures = if (disclosuresArr != null)
                 (0 until disclosuresArr.length()).map { disclosuresArr.getString(it) }
             else
                 emptyList()
-
-            // Build digest → disclosure map for fast lookup
-            val md = java.security.MessageDigest.getInstance("SHA-256")
-            val digestToDisc = allDisclosures.associateBy { disc ->
-                android.util.Base64.encodeToString(
-                    md.digest(disc.toByteArray()), android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP
-                )
-            }
-
             val credIdsArr = td.data.optJSONArray("credential_ids")
             val credIds = if (credIdsArr != null)
                 (0 until credIdsArr.length()).map { credIdsArr.getString(it) }
@@ -145,27 +132,12 @@ class OpenId4VP(
             val format = td.data.optString("format", "dc+sd-jwt")
 
             (0 until payloadArr.length()).map { i ->
-                val payload = payloadArr.getJSONObject(i)
-
-                // Find disclosures whose digest appears in this payload's _sd array
-                val sdArr = payload.optJSONArray("_sd")
-                val matchedDisclosures = if (sdArr != null) {
-                    val sdDigests = (0 until sdArr.length()).map { sdArr.getString(it) }.toSet()
-                    allDisclosures.filter { disc ->
-                        val digest = android.util.Base64.encodeToString(
-                            md.digest(disc.toByteArray()), android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP
-                        )
-                        digest in sdDigests
-                    }
-                } else {
-                    emptyList()
-                }
-
                 DelegateProposal(
                     encodedItem = td.encodedData,
                     format = format,
-                    delegatePayload = payload,
-                    delegateDisclosures = matchedDisclosures,
+                    delegatePayload = payloadArr.getJSONObject(i),
+                    // Sub-disclosures attached to first proposal
+                    delegateDisclosures = if (i == 0) subDisclosures else emptyList(),
                     credentialIds = credIds
                 )
             }

@@ -165,29 +165,19 @@ class SdJwt(
     /**
      * Produces a dSD-JWT chain for the HITL AP2 mandate flow.
      *
-     * **Parallel design** — every KB-SD-JWT's `sd_hash` covers only the DPC base
-     * (issuer_jwt + DPC disclosures + this mandate's own delegate_disclosures), NOT any other
-     * KB-SD-JWT. This means each mandate is independently presentable to its verifier:
-     *  - Checkout mandate → agent presents to merchant (with checkout_disc opened)
-     *  - Payment mandate  → agent presents to credential provider (no checkout_disc, no checkout KB-SD-JWT)
+     * Structure (per dSD-JWT spec):
+     *   dpc_jwt ~ dpc_discs ~ KB-SD-JWT ~ mandate_disc_1 ~ mandate_disc_2 ~ [sub_discs] ~
      *
-     * Cross-mandate binding is provided by `payment.reference.checkout_reference` in the payment
-     * mandate's constraints (= SHA-256(checkout_jwt)), verified at the application layer.
+     * - ONE KB-SD-JWT, signed by device key, whose [delegate_payload] is an array of
+     *   SHA-256 digests — one per mandate disclosure.
+     * - Each mandate object from [delegateProposals] becomes an array disclosure
+     *   base64url(["<salt>", <mandate_json>]) appended AFTER the KB-SD-JWT.
+     * - [sd_hash] in KB-SD-JWT covers the DPC SD-JWT only: issuer_jwt ~ dpc_discs ~
+     * - [_sd_alg] = "sha-256"; typ = "kb-sd-jwt+kb" (delegate payload contains cnf.jwk)
      *
-     * Chain structure (all parts joined with `~`):
-     * ```
-     *   dpc_issuer_jwt ~ dpc_disc1 ~ ... ~ checkout_disc ~ KB-SD-JWT_checkout
-     *                                                     ~ KB-SD-JWT_payment ~
-     * ```
-     * KB-SD-JWT_payment.sd_hash = SHA-256(dpc_jwt~dpc_discs~) only — does NOT cover KB-SD-JWT_checkout.
-     *
-     * Agent presentations:
-     *  - → Merchant:            dpc_jwt~dpc_discs~checkout_disc~KB-SD-JWT_checkout~ + agent KB-JWT
-     *  - → Credential provider: dpc_jwt~dpc_discs~KB-SD-JWT_payment~ + agent KB-JWT
-     *    (payment network never receives checkout_disc or KB-SD-JWT_checkout)
-     *
-     * Every KB-SD-JWT is signed with the holder's device key (cnf of the DPC).
-     * Trailing `~` signals no agent KB-JWT yet; agent appends it when presenting to a verifier.
+     * Agent presentations (agent appends its own KB-JWT, revealing one mandate disc):
+     *   → Merchant:          dpc_jwt~dpc_discs~KB-SD-JWT~checkout_disc~agent_KB-JWT
+     *   → Credential provider: dpc_jwt~dpc_discs~KB-SD-JWT~payment_disc~agent_KB-JWT
      */
     @OptIn(ExperimentalSerializationApi::class)
     fun presentWithDelegations(
@@ -201,7 +191,7 @@ class SdJwt(
             "Use present() when there are no delegate proposals"
         }
 
-        // ── Step 1: select DPC disclosures (same logic as present()) ──────────────────
+        // ── Step 1: select DPC disclosures ────────────────────────────────────────────
         val selectedDisclosures = mutableListOf<String>()
         if (claimSets == null) {
             selectedDisclosures.addAll(disclosures)
@@ -240,64 +230,65 @@ class SdJwt(
             require(matched) { "Could not match against any claim sets." }
         }
 
-        // ── Step 2: build the running component list ──────────────────────────────────
-        // Parts accumulate here; they are joined with `~` to form the chain.
-        val parts = mutableListOf<String>()
-        parts.add(issuerJwt)
-        parts.addAll(selectedDisclosures)
+        // ── Step 2: sd_hash over DPC base (issuer_jwt ~ dpc_discs ~) ─────────────────
+        val dpcBase = (listOf(issuerJwt) + selectedDisclosures).joinToString("~", postfix = "~")
+        val sdHash = MessageDigest.getInstance("SHA-256")
+            .digest(dpcBase.encodeToByteArray())
+            .toBase64UrlNoPadding()
 
-        // ── Step 3: for each delegate proposal, append its disclosures then a KB-SD-JWT ─
-        val isLast = { idx: Int -> idx == delegateProposals.lastIndex }
+        // ── Step 3: create one mandate disclosure per proposal ────────────────────────
+        // Each disclosure: base64url(["<random_salt>", <mandate_json_object>])
+        val rng = java.security.SecureRandom()
+        val mandateDisclosures = delegateProposals.map { proposal ->
+            val saltBytes = ByteArray(16).also { rng.nextBytes(it) }
+            val salt = saltBytes.toBase64UrlNoPadding()
+            val discArr = JSONArray().put(salt).put(proposal.delegatePayload)
+            discArr.toString().toByteArray().toBase64UrlNoPadding()
+        }
 
-        for ((idx, proposal) in delegateProposals.withIndex()) {
-            // Append the delegate's own selective disclosures (for claims like checkout_jwt)
-            parts.addAll(proposal.delegateDisclosures)
-
-            // sd_hash covers ONLY: dpc_base + this mandate's own delegate_disclosures
-            // Parallel design: does NOT include previous KB-SD-JWTs
-            val precedingParts = listOf(issuerJwt) + selectedDisclosures + proposal.delegateDisclosures
-            val precedingChain = precedingParts.joinToString("~", postfix = "~")
-            val sdHash = MessageDigest.getInstance("SHA-256")
-                .digest(precedingChain.encodeToByteArray())
+        // ── Step 4: digest of each mandate disclosure → KB-SD-JWT delegate_payload ────
+        val mandateDigests = mandateDisclosures.map { disc ->
+            MessageDigest.getInstance("SHA-256")
+                .digest(disc.encodeToByteArray())
                 .toBase64UrlNoPadding()
+        }
 
-            // Build KB-SD-JWT header: typ="kb+jwt" (it IS a KB-JWT for the DPC SD-JWT)
-            val kbSdHeader = buildJsonObject {
-                put("typ", "kb+jwt")
-                put("alg", "ES256")
-            }
-
-            // Build KB-SD-JWT payload = delegate_payload claims + standard KB fields
-            // The delegate_payload already carries: vct, cnf.jwk (agent key), constraints etc.
-            val kbSdPayload = buildJsonObject {
-                // KB standard fields
-                put("iat", Instant.now().epochSecond)
-                put("aud", aud)
-                put("nonce", nonce)
-                put("sd_hash", sdHash)
-
-                // Mandate / delegate fields from the proposal (verbatim copy)
-                for (key in proposal.delegatePayload.keys()) {
-                    put(key, anyToJsonElement(proposal.delegatePayload.get(key)))
-                }
-
-                // Transaction data hashes go in the LAST KB-SD-JWT only
-                if (isLast(idx) && transactionDataHashes.isNotEmpty()) {
-                    for (entry in transactionDataHashes) {
-                        putJsonArray(entry.key) {
-                            entry.value.forEach { data -> add(data.toBase64UrlNoPadding()) }
-                        }
+        // ── Step 5: build ONE KB-SD-JWT ───────────────────────────────────────────────
+        val kbSdHeader = buildJsonObject {
+            put("typ", "kb-sd-jwt+kb")   // delegate payload contains cnf.jwk
+            put("alg", "ES256")
+        }
+        val kbSdPayload = buildJsonObject {
+            put("iat", Instant.now().epochSecond)
+            put("aud", aud)
+            put("nonce", nonce)
+            put("sd_hash", sdHash)
+            putJsonArray("delegate_payload") { mandateDigests.forEach { add(it) } }
+            put("_sd_alg", "sha-256")
+            if (transactionDataHashes.isNotEmpty()) {
+                for (entry in transactionDataHashes) {
+                    putJsonArray(entry.key) {
+                        entry.value.forEach { data -> add(data.toBase64UrlNoPadding()) }
                     }
                 }
             }
-
-            val kbSdJwt = createJWTES256(kbSdHeader, kbSdPayload, holderKey)
-            parts.add(kbSdJwt)
         }
+        val kbSdJwt = createJWTES256(kbSdHeader, kbSdPayload, holderKey)
 
-        // ── Step 4: return chain with trailing ~ (no agent KB-JWT yet) ────────────────
-        return parts.joinToString("~", postfix = "~")
+        // ── Step 6: collect sub-disclosures (usually empty in our flow) ───────────────
+        val allSubDisclosures = delegateProposals.flatMap { it.delegateDisclosures }
+
+        // ── Step 7: assemble chain ─────────────────────────────────────────────────────
+        // dpc_jwt ~ dpc_discs ~ KB-SD-JWT ~ mandate_disc_1 ~ mandate_disc_2 ~ sub_discs ~
+        val outputParts = mutableListOf<String>()
+        outputParts.add(issuerJwt)
+        outputParts.addAll(selectedDisclosures)
+        outputParts.add(kbSdJwt)
+        outputParts.addAll(mandateDisclosures)
+        outputParts.addAll(allSubDisclosures)
+        return outputParts.joinToString("~", postfix = "~")
     }
+
 
     /** Converts an org.json value to a kotlinx.serialization JsonElement. */
     private fun anyToJsonElement(v: Any?): kotlinx.serialization.json.JsonElement = when (v) {
