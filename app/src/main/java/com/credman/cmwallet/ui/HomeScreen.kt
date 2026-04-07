@@ -75,6 +75,17 @@ fun HomeScreen(
             modifier = Modifier.padding(innerPadding),
         ) {
             HorizontalDivider(thickness = 2.dp)
+            // AP2 E2E test launcher
+            val context = androidx.compose.ui.platform.LocalContext.current
+            androidx.compose.material3.Button(
+                onClick = {
+                    context.startActivity(
+                        android.content.Intent(context, com.credman.cmwallet.testap2.Ap2TestActivity::class.java)
+                    )
+                },
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp).fillMaxWidth()
+            ) { Text("▶ AP2 dSD-JWT E2E Test") }
+            HorizontalDivider(thickness = 1.dp)
             CredentialList(
                 uiState.credentials,
                 onCredentialClick = { cred ->
