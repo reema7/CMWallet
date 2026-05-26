@@ -3003,7 +3003,7 @@
             ]
         },
         "displayData": {
-            "title": "Pocket Bank SkyFly ACME Credit"
+            "title": "Visa Platinum \u00b7\u00b7\u00b7\u00b74242"
         },
         "credentials": [
             {
@@ -3084,9 +3084,9 @@
             ],
             "display": [
                 {
-                    "name": "Pocket Bank SkyFly ACME Credit",
+                    "name": "Visa Platinum \u00b7\u00b7\u00b7\u00b74242",
                     "locale": "en-US",
-                    "description": "Pocket Bank SkyFly ACME Credit"
+                    "description": "Visa Platinum \u00b7\u00b7\u00b7\u00b74242"
                 }
             ],
             "claims": [
@@ -3196,7 +3196,7 @@
             ]
         },
         "displayData": {
-            "title": "Pocket Bank SkyFly ACME Credit"
+            "title": "Visa Platinum \u00b7\u00b7\u00b7\u00b74242"
         },
         "credentials": [
             {

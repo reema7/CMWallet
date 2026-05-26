@@ -174,7 +174,7 @@ class Ap2SampleGenerator {
         )
 
         // ── Parse the chain for annotation ────────────────────────────────────
-        val chainParts = vpChain.split("~").dropLast(1)
+        val chainParts = vpChain.split("~").filter { it.isNotEmpty() }
         fun dec(b64: String): JSONObject {
             val p = b64.padEnd(b64.length + (4-b64.length%4)%4,'=')
             return JSONObject(String(JBase64.getUrlDecoder().decode(p)))
@@ -535,11 +535,16 @@ class Ap2SampleGenerator {
         )
 
         // sd_hashes for agent KB-JWTs
-        val parts = chain.split("~").dropLast(1)
+        // Split on ~~ to separate base SD-JWT from delegation chain, then parse each section.
+        val sections = chain.split("~~")
+        val baseParts = sections[0].split("~").filter { it.isNotEmpty() }
+        val delegateParts = if (sections.size > 1) sections[1].split("~").filter { it.isNotEmpty() } else emptyList()
+        val parts = baseParts + delegateParts
         val isCompact = { s: String -> s.split(".").size == 3 }
         val kbPositions = parts.indices.filter { it > 0 && isCompact(parts[it]) }
-        val checkoutPrefix = parts.subList(0, kbPositions[0]+1).joinToString("~", postfix="~")
-        val fullPrefix = parts.joinToString("~", postfix="~")
+        // Reconstruct with ~~ between base and delegation sections for hash computation
+        val checkoutPrefix = baseParts.joinToString("~") + "~~" + delegateParts.take(kbPositions[0] - baseParts.size + 1).joinToString("~")
+        val fullPrefix = chain
         val sdHashCheckout = JBase64.getUrlEncoder().withoutPadding()
             .encodeToString(MessageDigest.getInstance("SHA-256").digest(checkoutPrefix.toByteArray()))
         val sdHashFull = JBase64.getUrlEncoder().withoutPadding()

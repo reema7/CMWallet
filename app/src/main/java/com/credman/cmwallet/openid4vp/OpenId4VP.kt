@@ -91,9 +91,11 @@ class OpenId4VP(
                         .toString(Charsets.UTF_8)
                 val transactionDataItem = JSONObject(transactionDataItemJson)
                 val credentialIds = mutableListOf<String>()
-                val credentialIdsJson = transactionDataItem.getJSONArray("credential_ids")
-                for (j in 0 until credentialIdsJson.length()) {
-                    credentialIds.add(credentialIdsJson.getString(j))
+                val credentialIdsJson = transactionDataItem.optJSONArray("credential_ids")
+                if (credentialIdsJson != null) {
+                    for (j in 0 until credentialIdsJson.length()) {
+                        credentialIds.add(credentialIdsJson.getString(j))
+                    }
                 }
 
                 tempList.add(
@@ -175,6 +177,22 @@ class OpenId4VP(
                         "Confirm transaction",
                         "Authorize payment of amount $amount to $merchantName."
                     )
+                }
+                if (authenticationTitleAndSubtitle == null) {
+                    val consentText = decoded.optString("consent_text", "")
+                    val type = decoded.optString("type", "")
+                    if (consentText.isNotBlank()) {
+                        authenticationTitleAndSubtitle = Pair("Authorize action", consentText)
+                    } else if (type == "delegate") {
+                        val payload = decoded.optJSONArray("delegate_payload")
+                        if (payload != null && payload.length() > 0) {
+                            val mandate = payload.getJSONObject(0)
+                            val mandateConsent = mandate.optString("consent_text", "")
+                            if (mandateConsent.isNotBlank()) {
+                                authenticationTitleAndSubtitle = Pair("Authorize action", mandateConsent)
+                            }
+                        }
+                    }
                 }
             }
         }

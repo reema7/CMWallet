@@ -166,7 +166,11 @@ class SdJwt(
      * Produces a dSD-JWT chain for the HITL AP2 mandate flow.
      *
      * Structure (per dSD-JWT spec):
-     *   dpc_jwt ~ dpc_discs ~ KB-SD-JWT ~ mandate_disc_1 ~ mandate_disc_2 ~ [sub_discs] ~
+     *   sd_jwt ~ dpc_discs ~~ KB-SD-JWT ~ mandate_disc_1 ~ mandate_disc_2 ~ [sub_discs]
+     *
+     * The double tilde (~~) separates the base SD-JWT (issuer JWT + identity disclosures)
+     * from the delegation chain (KB-SD-JWT + mandate disclosures). This makes it easy to
+     * split the two conceptual sections when parsing.
      *
      * - ONE KB-SD-JWT, signed by device key, whose [delegate_payload] is an array of
      *   SHA-256 digests — one per mandate disclosure.
@@ -176,8 +180,8 @@ class SdJwt(
      * - [_sd_alg] = "sha-256"; typ = "kb-sd-jwt+kb" (delegate payload contains cnf.jwk)
      *
      * Agent presentations (agent appends its own KB-JWT, revealing one mandate disc):
-     *   → Merchant:          dpc_jwt~dpc_discs~KB-SD-JWT~checkout_disc~agent_KB-JWT
-     *   → Credential provider: dpc_jwt~dpc_discs~KB-SD-JWT~payment_disc~agent_KB-JWT
+     *   → Merchant:          dpc_jwt~dpc_discs~~KB-SD-JWT~checkout_disc~agent_KB-JWT
+     *   → Credential provider: dpc_jwt~dpc_discs~~KB-SD-JWT~payment_disc~agent_KB-JWT
      */
     @OptIn(ExperimentalSerializationApi::class)
     fun presentWithDelegations(
@@ -280,13 +284,11 @@ class SdJwt(
 
         // ── Step 7: assemble chain ─────────────────────────────────────────────────────
         // dpc_jwt ~ dpc_discs ~ KB-SD-JWT ~ mandate_disc_1 ~ mandate_disc_2 ~ sub_discs ~
-        val outputParts = mutableListOf<String>()
-        outputParts.add(issuerJwt)
-        outputParts.addAll(selectedDisclosures)
-        outputParts.add(kbSdJwt)
-        outputParts.addAll(mandateDisclosures)
-        outputParts.addAll(allSubDisclosures)
-        return outputParts.joinToString("~", postfix = "~")
+        // sd_jwt ~ dpc_discs ~~ KB-SD-JWT ~ mandate_disc_1 ~ mandate_disc_2 ~ sub_discs
+        // The ~~ separates the base SD-JWT from the delegation chain.
+        val baseParts = listOf(issuerJwt) + selectedDisclosures
+        val delegateParts = listOf(kbSdJwt) + mandateDisclosures + allSubDisclosures
+        return baseParts.joinToString("~") + "~~" + delegateParts.joinToString("~")
     }
 
 

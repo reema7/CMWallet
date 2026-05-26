@@ -20,11 +20,22 @@ static int B64Lookup(char x) {
 
 int B64DecodeURL(char* input, char** output) {
     int b64len = strlen(input);
-    int output_len = (b64len*3) / 4;
+    // Pad input to multiple of 4 if needed (base64url omits padding)
+    int padded_len = b64len;
+    char *padded = NULL;
+    if (b64len % 4 != 0) {
+        padded_len = b64len + (4 - b64len % 4);
+        padded = malloc(padded_len + 1);
+        memcpy(padded, input, b64len);
+        for (int i = b64len; i < padded_len; i++) padded[i] = '=';
+        padded[padded_len] = '\0';
+        input = padded;
+    }
+    int output_len = (padded_len*3) / 4;
     char* buffer = malloc(output_len+1);
-    
+
     int count = 0;
-    for(int i=0; i<b64len; i+=4) {
+    for(int i=0; i<padded_len; i+=4) {
         uint32_t v = 0;
         for(int j=0; j<4; j++) {
             v = v << 6;
@@ -34,15 +45,16 @@ int B64DecodeURL(char* input, char** output) {
         buffer[count++] = (v >> 8) & 0xff;
         buffer[count++] = v & 0xFF;
     }
+
+    if (padded_len > 0 && input[padded_len-1] == '=') {
+        output_len--;
+    }
+    if (padded_len > 1 && input[padded_len-2] == '=') {
+        output_len--;
+    }
+
+    buffer[output_len] = '\0';
     *output = buffer;
-
-    if (b64len > 0 && input[b64len-1] == '=') {
-        output_len--;
-    }
-    if (b64len > 1 && input[b64len-2] == '=') {
-        output_len--;
-    }
-
-
+    if (padded) free(padded);
     return output_len;
 }

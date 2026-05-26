@@ -48,7 +48,7 @@ void report_credential_set_length(char* set_id, int curr_length, int curr_set_id
     }
 }
 
-void report_matched_credential(uint32_t wasm_version, cJSON* matched_doc, cJSON* matched_credential_id, int doc_idx, int request_id, char* set_id, char* dcql_set_idx, char* dcql_option_idx, char *creds_blob, cJSON* transaction_credential_ids, char* merchant_name, char* transaction_amount, char* additional_info) {
+void report_matched_credential(uint32_t wasm_version, cJSON* matched_doc, cJSON* matched_credential_id, int doc_idx, int request_id, char* set_id, char* dcql_set_idx, char* dcql_option_idx, char *creds_blob, cJSON* transaction_credential_ids, char* merchant_name, char* transaction_amount, char* additional_info, char* consent_text) {
     cJSON *matched_credential = cJSON_GetObjectItem(matched_doc, "matched");
     cJSON *c;
     cJSON_ArrayForEach(c, matched_credential)
@@ -66,7 +66,57 @@ void report_matched_credential(uint32_t wasm_version, cJSON* matched_doc, cJSON*
         }
         char *metadata = cJSON_PrintUnformatted(metadata_object);
 
-        if (transaction_credential_ids != NULL)
+        if (consent_text != NULL)
+        {
+            cJSON* c_display = cJSON_GetObjectItem(cJSON_GetObjectItem(c, "display"), "verification");
+            char *title = cJSON_GetStringValue(cJSON_GetObjectItem(c_display, "title"));
+            char *subtitle = cJSON_GetStringValue(cJSON_GetObjectItem(c_display, "subtitle"));
+            char *explainer = cJSON_GetStringValue(cJSON_GetObjectItem(c_display, "explainer"));
+            char *metadata_display_text = cJSON_GetStringValue(cJSON_GetObjectItem(c_display, "metadata_display_text"));
+            cJSON *icon = cJSON_GetObjectItem(c_display, "icon");
+            int icon_start_int = 0;
+            int icon_len = 0;
+            if (icon != NULL)
+            {
+                cJSON *start = cJSON_GetObjectItem(icon, "start");
+                cJSON *length = cJSON_GetObjectItem(icon, "length");
+                if (start != NULL && length != NULL)
+                {
+                    double icon_start = (cJSON_GetNumberValue(start));
+                    icon_start_int = icon_start;
+                    icon_len = (int)(cJSON_GetNumberValue(length));
+                }
+            }
+            if (wasm_version > 1)
+            {
+                printf("AddEntryToSet (consent) %s, warning: %s\n", matched_id, consent_text);
+                AddEntryToSet(matched_id, creds_blob + icon_start_int, icon_len, title, subtitle, explainer, consent_text, metadata, set_id, doc_idx);
+            }
+            else
+            {
+                AddStringIdEntry(matched_id, creds_blob + icon_start_int, icon_len, title, subtitle, NULL, consent_text);
+            }
+            cJSON *matched_claim_names = cJSON_GetObjectItem(c, "matched_claim_names");
+            cJSON *claim;
+            cJSON_ArrayForEach(claim, matched_claim_names)
+            {
+                char *claim_display = cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetObjectItem(claim, "verification"), "display"));
+                char *claim_value = cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetObjectItem(claim, "verification"), "display_value"));
+                if (wasm_version > 1)
+                {
+                    printf("AddFieldToEntrySet (consent) %s, field: %s\n", matched_id, claim_display);
+                    AddFieldToEntrySet(matched_id, claim_display, claim_value, set_id, doc_idx);
+                }
+                else
+                {
+                    AddFieldForStringIdEntry(matched_id, claim_display, claim_value);
+                }
+            }
+            if (wasm_version >= 5) {
+                AddMetadataDisplayTextToEntrySet(matched_id, metadata_display_text, set_id, doc_idx);
+            }
+        }
+        else if (transaction_credential_ids != NULL)
         {
             printf("transaction cred ids %s\n", cJSON_Print(transaction_credential_ids));
             cJSON *transaction_credential_id;
@@ -170,7 +220,7 @@ void report_matched_credential(uint32_t wasm_version, cJSON* matched_doc, cJSON*
     }
 }
 
-void report_matched_credential_set(char* set_id, int curr_set_idx, cJSON *matched_credential_sets, int curr_doc_idx, int credential_sets_length, uint32_t wasm_version, cJSON* matched_docs, int request_id, char *creds_blob, cJSON* transaction_credential_ids, char* merchant_name, char* transaction_amount, char* additional_info) {
+void report_matched_credential_set(char* set_id, int curr_set_idx, cJSON *matched_credential_sets, int curr_doc_idx, int credential_sets_length, uint32_t wasm_version, cJSON* matched_docs, int request_id, char *creds_blob, cJSON* transaction_credential_ids, char* merchant_name, char* transaction_amount, char* additional_info, char* consent_text) {
     if (curr_set_idx < credential_sets_length) {
         cJSON *matched_credential_set = cJSON_GetArrayItem(matched_credential_sets, curr_set_idx);
         cJSON *matched_option;
@@ -185,12 +235,12 @@ void report_matched_credential_set(char* set_id, int curr_set_idx, cJSON *matche
             {
                 printf("matched_credential_id %s\n", cJSON_GetStringValue(matched_credential_id));
                 matched_doc = cJSON_GetObjectItemCaseSensitive(matched_docs, cJSON_GetStringValue(matched_credential_id));
-                report_matched_credential(wasm_version, matched_doc, matched_credential_id, new_doc_idx, request_id, set_id, dcql_set_idx, dcql_option_idx, creds_blob, transaction_credential_ids, merchant_name, transaction_amount, additional_info);
+                report_matched_credential(wasm_version, matched_doc, matched_credential_id, new_doc_idx, request_id, set_id, dcql_set_idx, dcql_option_idx, creds_blob, transaction_credential_ids, merchant_name, transaction_amount, additional_info, consent_text);
                 ++new_doc_idx;
             }
 
             ++curr_set_idx;
-            report_matched_credential_set(set_id, curr_set_idx, matched_credential_sets, new_doc_idx, credential_sets_length, wasm_version, matched_docs, request_id, creds_blob, transaction_credential_ids, merchant_name, transaction_amount, additional_info);
+            report_matched_credential_set(set_id, curr_set_idx, matched_credential_sets, new_doc_idx, credential_sets_length, wasm_version, matched_docs, request_id, creds_blob, transaction_credential_ids, merchant_name, transaction_amount, additional_info, consent_text);
         }
     }
 }
@@ -235,6 +285,8 @@ int main()
     char *merchant_name = NULL;
     char *transaction_amount = NULL;
     char *additional_info = NULL;
+    char *consent_text = NULL;
+    char *consent_text_raw = NULL;
     for (int i = 0; i < requests_size; i++)
     {
         cJSON *request = cJSON_GetArrayItem(requests, i);
@@ -288,201 +340,71 @@ int main()
             cJSON *transaction_credential_ids = NULL;
             if (transaction_data_list != NULL)
             {
-                int td_count = cJSON_GetArraySize(transaction_data_list);
-                for (int td_i = 0; td_i < td_count; td_i++)
+                if (cJSON_GetArraySize(transaction_data_list) == 1)
                 {
-                    cJSON *transaction_data_encoded = cJSON_GetArrayItem(transaction_data_list, td_i);
+                    cJSON *transaction_data_encoded = cJSON_GetArrayItem(transaction_data_list, 0);
                     char *transaction_data_encoded_str = cJSON_GetStringValue(transaction_data_encoded);
                     char *transaction_data_json;
                     int transaction_data_json_len = B64DecodeURL(transaction_data_encoded_str, &transaction_data_json);
-                    printf("transaction data [%d] %s\n", td_i, transaction_data_json);
-                    cJSON *td_item = cJSON_Parse(transaction_data_json);
-                    char *transaction_data_type = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "type"));
+                    printf("transaction data %s\n", transaction_data_json);
+                    transaction_data = cJSON_Parse(transaction_data_json);
+                    transaction_credential_ids = cJSON_GetObjectItem(transaction_data, "credential_ids");
+                    char *transaction_data_type = cJSON_GetStringValue(cJSON_GetObjectItem(transaction_data, "type"));
+                    if (strcmp(transaction_data_type, "urn:eudi:sca:payment:1") == 0) {
+                        cJSON *payload = cJSON_GetObjectItem(transaction_data, "payload");
+                        merchant_name = cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetObjectItem(payload, "payee"), "name"));
+                        
+                        transaction_amount = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "amount_display"));
 
-                    // Use the first item that provides payment display info as the primary
-                    // Also track credential_ids from the first item for matching
-                    if (td_i == 0) {
-                        transaction_data = td_item;
-                        transaction_credential_ids = cJSON_GetObjectItem(td_item, "credential_ids");
-                    }
-
-                    if (transaction_data_type == NULL) {
-                        // skip malformed item
-                    } else if (strcmp(transaction_data_type, "urn:eudi:sca:payment:1") == 0) {
-                        cJSON *payload = cJSON_GetObjectItem(td_item, "payload");
-                        if (merchant_name == NULL)
-                            merchant_name = cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetObjectItem(payload, "payee"), "name"));
                         if (transaction_amount == NULL) {
-                            transaction_amount = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "amount_display"));
-                            if (transaction_amount == NULL) {
-                                double amount = cJSON_GetNumberValue(cJSON_GetObjectItem(payload, "amount"));
-                                int length_for_amount = (int)log10(amount) + 1;
-                                char *currency = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "currency"));
-                                int total_length = length_for_amount + 4 + (currency ? strlen(currency) : 3) + 2;
-                                transaction_amount = malloc(total_length);
-                                sprintf(transaction_amount, "%s %f", currency ? currency : "USD", amount);
-                            }
+                            double amount = cJSON_GetNumberValue(cJSON_GetObjectItem(payload, "amount"));
+                            int length_for_amount = log10(amount);
+                            char *currency = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "currency"));
+                            int total_length = length_for_amount + 4 + strlen(currency) + 2;
+                            transaction_amount = malloc(length_for_amount + 4 + strlen(currency) + 2);
+                            sprintf(transaction_amount, "%s %f", currency, amount);
+                            transaction_amount[total_length - 1] = '\0';
                         }
-                        if (additional_info == NULL)
-                            additional_info = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "additional_info"));
+                        printf("transaction amount %s\n", transaction_amount);
+                        
+                        additional_info = cJSON_GetStringValue(cJSON_GetObjectItem(transaction_data, "additional_info"));
                     } else if (strcmp(transaction_data_type, "payment_details") == 0) {
-                        if (merchant_name == NULL)
-                            merchant_name = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "payee_name"));
-                        if (transaction_amount == NULL) {
-                            char *amount = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "payment_amount"));
-                            char *currency = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "payment_currency"));
-                            if (amount && currency) {
-                                transaction_amount = malloc(strlen(amount) + strlen(currency) + 2);
-                                sprintf(transaction_amount, "%s %s", currency, amount);
-                            }
-                        }
-                        if (additional_info == NULL)
-                            additional_info = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "additional_info"));
+                        merchant_name = cJSON_GetStringValue(cJSON_GetObjectItem(transaction_data, "payee_name"));
+
+                        char *amount = cJSON_GetStringValue(cJSON_GetObjectItem(transaction_data, "payment_amount"));
+                        char *currency = cJSON_GetStringValue(cJSON_GetObjectItem(transaction_data, "payment_currency"));
+                        transaction_amount = malloc(strlen(amount) + strlen(currency) + 2);
+                        sprintf(transaction_amount, "%s %s", currency, amount);
+                        printf("transaction amount %s\n", transaction_amount);
+
+                        additional_info = cJSON_GetStringValue(cJSON_GetObjectItem(transaction_data, "additional_info"));
                     } else if (strcmp(transaction_data_type, "delegate") == 0) {
-                        // AP2 dSD-JWT mandate proposal.
-                        // delegate_payload[] contains mandate objects:
-                        //   mandate.checkout.1: { vct, checkout_hash, checkout_jwt, exp, cnf }
-                        //     checkout_jwt payload (UCP): { id, currency, merchant:{name},
-                        //                                   line_items:[{title,quantity,unit_price}],
-                        //                                   totals:{total,...} }
-                        //   mandate.payment.1:  { vct, transaction_id, payee:{id,name},
-                        //                         amount:{value,currency}, payment_instrument, exp, cnf }
-                        //
-                        // Build additional_info as the structured JSON the picker UI expects:
-                        //   { "tableHeader": [...], "tableRows": [[...], ...], "footer": "..." }
-                        // tableHeader: ["Item", "Qty", "Price"]
-                        // tableRows: one row per line_item from checkout_jwt
-                        // footer: "Total: <currency> <total>" from checkout_jwt totals
-                        cJSON *delegate_payload_arr = cJSON_GetObjectItem(td_item, "delegate_payload");
-                        char *payee_name_val      = NULL;
-                        char *amt_value_val       = NULL;
-                        char *amt_currency_val    = NULL;
-                        cJSON *checkout_jwt_payload = NULL;   // decoded JWT body for line items
-
-                        if (delegate_payload_arr != NULL) {
-                            int dp_count = cJSON_GetArraySize(delegate_payload_arr);
-                            for (int dp_i = 0; dp_i < dp_count; dp_i++) {
-                                cJSON *dp = cJSON_GetArrayItem(delegate_payload_arr, dp_i);
-                                char *vct = cJSON_GetStringValue(cJSON_GetObjectItem(dp, "vct"));
-                                if (vct == NULL) continue;
-
-                                if (strcmp(vct, "mandate.payment.1") == 0) {
-                                    // payee.name → merchant_name
-                                    cJSON *payee = cJSON_GetObjectItem(dp, "payee");
-                                    if (payee != NULL && payee_name_val == NULL)
-                                        payee_name_val = cJSON_GetStringValue(cJSON_GetObjectItem(payee, "name"));
-                                    // amount.{value,currency} → transaction_amount
-                                    cJSON *amount_obj = cJSON_GetObjectItem(dp, "amount");
-                                    if (amount_obj != NULL) {
-                                        if (amt_value_val == NULL)
-                                            amt_value_val = cJSON_GetStringValue(cJSON_GetObjectItem(amount_obj, "value"));
-                                        if (amt_currency_val == NULL)
-                                            amt_currency_val = cJSON_GetStringValue(cJSON_GetObjectItem(amount_obj, "currency"));
+                        merchant_name = cJSON_GetStringValue(cJSON_GetObjectItem(transaction_data, "merchant_name"));
+                        transaction_amount = cJSON_GetStringValue(cJSON_GetObjectItem(transaction_data, "amount"));
+                        additional_info = cJSON_GetStringValue(cJSON_GetObjectItem(transaction_data, "additional_info"));
+                        // Look for mandate.consent.1 in delegate_payload
+                        cJSON *delegate_payload = cJSON_GetObjectItem(transaction_data, "delegate_payload");
+                        if (delegate_payload != NULL) {
+                            cJSON *dp_entry;
+                            cJSON_ArrayForEach(dp_entry, delegate_payload) {
+                                char *vct = cJSON_GetStringValue(cJSON_GetObjectItem(dp_entry, "vct"));
+                                if (vct != NULL && strcmp(vct, "mandate.consent.1") == 0) {
+                                    char *raw_consent_text = cJSON_GetStringValue(cJSON_GetObjectItem(dp_entry, "consent_text"));
+                                    if (raw_consent_text != NULL) {
+                                        consent_text_raw = raw_consent_text;
+                                        const char *prefix = "consent_text~~";
+                                        consent_text = malloc(strlen(prefix) + strlen(raw_consent_text) + 1);
+                                        sprintf(consent_text, "%s%s", prefix, raw_consent_text);
+                                        printf("consent_text for UI: %s\n", consent_text);
                                     }
-
-                                } else if (strcmp(vct, "mandate.checkout.1") == 0 && checkout_jwt_payload == NULL) {
-                                    // Decode checkout_jwt to extract cart line items.
-                                    // checkout_jwt is a compact JWT: header.payload.sig
-                                    // We base64url-decode the payload (middle part).
-                                    char *checkout_jwt_str = cJSON_GetStringValue(cJSON_GetObjectItem(dp, "checkout_jwt"));
-                                    if (checkout_jwt_str != NULL) {
-                                        // Find second '.' (start of payload part)
-                                        char *dot1 = strchr(checkout_jwt_str, '.');
-                                        if (dot1 != NULL) {
-                                            char *payload_start = dot1 + 1;
-                                            char *dot2 = strchr(payload_start, '.');
-                                            int payload_len = dot2 ? (int)(dot2 - payload_start) : (int)strlen(payload_start);
-                                            // Copy payload segment to a NUL-terminated buffer
-                                            char *payload_b64 = malloc(payload_len + 1);
-                                            memcpy(payload_b64, payload_start, payload_len);
-                                            payload_b64[payload_len] = '\0';
-                                            // base64url-decode it
-                                            char *decoded_json = NULL;
-                                            int decoded_len = B64DecodeURL(payload_b64, &decoded_json);
-                                            free(payload_b64);
-                                            if (decoded_len > 0 && decoded_json != NULL) {
-                                                checkout_jwt_payload = cJSON_Parse(decoded_json);
-                                                free(decoded_json);
-                                            }
-                                        }
-                                    }
+                                    break;
                                 }
-                            }
-                        }
-
-                        // Populate merchant_name and transaction_amount for card picker header
-                        if (merchant_name == NULL && payee_name_val != NULL)
-                            merchant_name = payee_name_val;
-                        if (transaction_amount == NULL && amt_value_val != NULL && amt_currency_val != NULL) {
-                            transaction_amount = malloc(strlen(amt_value_val) + strlen(amt_currency_val) + 2);
-                            sprintf(transaction_amount, "%s %s", amt_currency_val, amt_value_val);
-                        }
-
-                        // Build additional_info JSON for picker UI
-                        if (additional_info == NULL) {
-                            cJSON *ai_obj = cJSON_CreateObject();
-
-                            // tableHeader: ["Item", "Qty", "Price"]
-                            cJSON *header_arr = cJSON_CreateArray();
-                            cJSON_AddItemToArray(header_arr, cJSON_CreateString("Item"));
-                            cJSON_AddItemToArray(header_arr, cJSON_CreateString("Qty"));
-                            cJSON_AddItemToArray(header_arr, cJSON_CreateString("Price"));
-                            cJSON_AddItemToObject(ai_obj, "tableHeader", header_arr);
-
-                            // tableRows: one row per line_item in checkout_jwt
-                            cJSON *rows_arr = cJSON_CreateArray();
-                            if (checkout_jwt_payload != NULL) {
-                                cJSON *line_items = cJSON_GetObjectItem(checkout_jwt_payload, "line_items");
-                                if (line_items != NULL) {
-                                    int li_count = cJSON_GetArraySize(line_items);
-                                    for (int li = 0; li < li_count; li++) {
-                                        cJSON *item = cJSON_GetArrayItem(line_items, li);
-                                        char *title      = cJSON_GetStringValue(cJSON_GetObjectItem(item, "title"));
-                                        char *unit_price = cJSON_GetStringValue(cJSON_GetObjectItem(item, "unit_price"));
-                                        double qty_num   = cJSON_GetNumberValue(cJSON_GetObjectItem(item, "quantity"));
-                                        char qty_str[16] = {0};
-                                        snprintf(qty_str, sizeof(qty_str), "%.0f", qty_num);
-                                        cJSON *row = cJSON_CreateArray();
-                                        cJSON_AddItemToArray(row, cJSON_CreateString(title      ? title      : ""));
-                                        cJSON_AddItemToArray(row, cJSON_CreateString(qty_str));
-                                        cJSON_AddItemToArray(row, cJSON_CreateString(unit_price ? unit_price : ""));
-                                        cJSON_AddItemToArray(rows_arr, row);
-                                    }
-                                }
-                            }
-                            cJSON_AddItemToObject(ai_obj, "tableRows", rows_arr);
-
-                            // footer: "Total: <currency> <total>" from checkout_jwt totals
-                            char footer_str[64] = {0};
-                            if (checkout_jwt_payload != NULL) {
-                                cJSON *totals = cJSON_GetObjectItem(checkout_jwt_payload, "totals");
-                                char *total_val  = totals ? cJSON_GetStringValue(cJSON_GetObjectItem(totals, "total")) : NULL;
-                                char *cur = cJSON_GetStringValue(cJSON_GetObjectItem(checkout_jwt_payload, "currency"));
-                                if (total_val && cur)
-                                    snprintf(footer_str, sizeof(footer_str), "Total: %s %s", cur, total_val);
-                                else if (total_val)
-                                    snprintf(footer_str, sizeof(footer_str), "Total: %s", total_val);
-                            }
-                            cJSON_AddItemToObject(ai_obj, "footer", cJSON_CreateString(footer_str));
-
-                            additional_info = cJSON_PrintUnformatted(ai_obj);
-                            cJSON_Delete(ai_obj);
-                            if (checkout_jwt_payload != NULL) {
-                                cJSON_Delete(checkout_jwt_payload);
-                                checkout_jwt_payload = NULL;
                             }
                         }
                     } else {
-                        // Generic fallback
-                        if (merchant_name == NULL)
-                            merchant_name = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "merchant_name"));
-                        if (transaction_amount == NULL)
-                            transaction_amount = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "amount"));
-                        if (additional_info == NULL)
-                            additional_info = cJSON_GetStringValue(cJSON_GetObjectItem(td_item, "additional_info"));
-                    }
-                    if (td_i > 0) {
-                        cJSON_Delete(td_item);
+                        merchant_name = cJSON_GetStringValue(cJSON_GetObjectItem(transaction_data, "merchant_name"));
+                        transaction_amount = cJSON_GetStringValue(cJSON_GetObjectItem(transaction_data, "amount"));
+                        additional_info = cJSON_GetStringValue(cJSON_GetObjectItem(transaction_data, "additional_info"));
                     }
                 }
             }
@@ -517,10 +439,10 @@ int main()
                         {
                             printf("matched_credential_id %s\n", cJSON_GetStringValue(matched_credential_id));
                             matched_doc = cJSON_GetObjectItemCaseSensitive(matched_docs, cJSON_GetStringValue(matched_credential_id));
-                            report_matched_credential(wasm_version, matched_doc, matched_credential_id, doc_idx, i, set_id_buffer, set_idx, option_idx, creds_blob, transaction_credential_ids, merchant_name, transaction_amount, additional_info);
+                            report_matched_credential(wasm_version, matched_doc, matched_credential_id, doc_idx, i, set_id_buffer, set_idx, option_idx, creds_blob, transaction_credential_ids, merchant_name, transaction_amount, additional_info, consent_text);
                             ++doc_idx;
                         }
-                        report_matched_credential_set(set_id_buffer, 1, matched_credential_sets, doc_idx, matched_credential_sets_size, wasm_version, matched_docs, i, creds_blob, transaction_credential_ids, merchant_name, transaction_amount, additional_info);
+                        report_matched_credential_set(set_id_buffer, 1, matched_credential_sets, doc_idx, matched_credential_sets_size, wasm_version, matched_docs, i, creds_blob, transaction_credential_ids, merchant_name, transaction_amount, additional_info, consent_text);
                     } else { // No credential_sets present in dcql
                         int chars_written = sprintf(set_id_buffer, "req:%d;null", i);
                         if (wasm_version > 1) { // Report set length
@@ -534,7 +456,7 @@ int main()
                         {
                             printf("matched_credential_id %s\n", cJSON_GetStringValue(matched_credential_id));
                             matched_doc = cJSON_GetObjectItemCaseSensitive(matched_docs, cJSON_GetStringValue(matched_credential_id));
-                            report_matched_credential(wasm_version, matched_doc, matched_credential_id, doc_idx, i, set_id_buffer, NULL, NULL, creds_blob, transaction_credential_ids, merchant_name, transaction_amount, additional_info);
+                            report_matched_credential(wasm_version, matched_doc, matched_credential_id, doc_idx, i, set_id_buffer, NULL, NULL, creds_blob, transaction_credential_ids, merchant_name, transaction_amount, additional_info, consent_text);
                             ++doc_idx;
                         }
                     }

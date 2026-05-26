@@ -227,10 +227,18 @@ class CredentialRepository {
         items.forEach { item ->
             when (item.config) {
                 is CredentialConfigurationSdJwtVc -> {
-                    val sdJwtVc = SdJwt(item.credentials.first().credential, (item.credentials.first().key as CredentialKeySoftware).privateKey)
+                    Log.i(TAG, "createRegistry: processing SdJwt credential id=${item.id} vct=${item.config.vct}")
+                    val sdJwtVc = try {
+                        SdJwt(item.credentials.first().credential, (item.credentials.first().key as CredentialKeySoftware).privateKey)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "createRegistry: SKIPPING ${item.id} — SdJwt parse failed: ${e.message}")
+                        return@forEach
+                    }
                     val rawJwt = sdJwtVc.verifiedResult.processedJwt
+                    Log.i(TAG, "createRegistry: rawJwt keys for ${item.id}: ${rawJwt.keys().asSequence().toList()}")
                     val claims = mutableListOf<SdJwtClaim>()
                     constructJwtClaims(rawJwt, item.config, claims, emptyList())
+                    Log.i(TAG, "createRegistry: ${item.id} has ${claims.size} claims: ${claims.map { it.path }}")
                     credentialEntries.add(SdJwtEntry(
                         verifiableCredentialType = rawJwt["vct"] as String,
                         claims = claims,
