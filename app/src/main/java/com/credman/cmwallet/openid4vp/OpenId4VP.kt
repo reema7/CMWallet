@@ -178,22 +178,9 @@ class OpenId4VP(
                         "Authorize payment of amount $amount to $merchantName."
                     )
                 }
-                if (authenticationTitleAndSubtitle == null) {
-                    val consentText = decoded.optString("consent_text", "")
-                    val type = decoded.optString("type", "")
-                    if (consentText.isNotBlank()) {
-                        authenticationTitleAndSubtitle = Pair("Authorize action", consentText)
-                    } else if (type == "delegate") {
-                        val payload = decoded.optJSONArray("delegate_payload")
-                        if (payload != null && payload.length() > 0) {
-                            val mandate = payload.getJSONObject(0)
-                            val mandateConsent = mandate.optString("consent_text", "")
-                            if (mandateConsent.isNotBlank()) {
-                                authenticationTitleAndSubtitle = Pair("Authorize action", mandateConsent)
-                            }
-                        }
-                    }
-                }
+                // Non-payment credentials (e.g. UserInfoVC): consent text is shown
+                // on the Credential Manager UI, so the biometric prompt only needs
+                // to authenticate — skip setting title/subtitle here.
             }
         }
         return TransactionDataResult(

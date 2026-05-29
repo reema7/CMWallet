@@ -42,13 +42,18 @@ fun performQueryOnCredential(
         require(credentials.length() == 1) { "Only support a single document" }
         credentials.getJSONObject(0)!!
     } else {
-        credentials.let {
-            for (i in 0..<it.length()) {
-                val dcqlCred = it.getJSONObject(i)
-                if (dcqlCred.optString("id") == dcqlCredId) {
-                    return@let dcqlCred
-                }
+        var found: JSONObject? = null
+        for (i in 0..<credentials.length()) {
+            val dcqlCred = credentials.getJSONObject(i)
+            if (dcqlCred.optString("id") == dcqlCredId) {
+                found = dcqlCred
+                break
             }
+        }
+        found ?: if (credentials.length() == 1) {
+            Log.w("DCQL", "dcqlCredId '$dcqlCredId' not found, falling back to single credential query")
+            credentials.getJSONObject(0)!!
+        } else {
             throw IllegalStateException("Could not find a matching dcql credential query")
         }
     }

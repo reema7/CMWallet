@@ -34,20 +34,27 @@ data class InternalSelectionInfo(
         }
 
         fun fromEntryIdJson(entryId: String): InternalSelectionInfo {
-            val entryIdJson = JSONObject(entryId)
-            val requestIdx =
-                if (entryIdJson.has("req_idx")) entryIdJson.getInt("req_idx") else entryIdJson.getInt(
-                    "provider_idx"
+            return try {
+                val entryIdJson = JSONObject(entryId)
+                val requestIdx =
+                    if (entryIdJson.has("req_idx")) entryIdJson.getInt("req_idx") else entryIdJson.getInt(
+                        "provider_idx"
+                    )
+                val selectedId =
+                    if (entryIdJson.has("entry_id")) entryIdJson.getString("entry_id") else entryIdJson.getString(
+                        "id"
+                    )
+                val dqclCredId = entryIdJson.getString("dcql_cred_id")
+                InternalSelectionInfo(
+                    requestIdx,
+                    listOf(SelectedCred(selectedId, dqclCredId, null))
                 )
-            val selectedId =
-                if (entryIdJson.has("entry_id")) entryIdJson.getString("entry_id") else entryIdJson.getString(
-                    "id"
+            } catch (e: Exception) {
+                InternalSelectionInfo(
+                    0,
+                    listOf(SelectedCred(entryId, entryId, null))
                 )
-            val dqclCredId = entryIdJson.getString("dcql_cred_id")
-            return InternalSelectionInfo(
-                requestIdx,
-                listOf(SelectedCred(selectedId, dqclCredId, null))
-            )
+            }
         }
     }
 }
